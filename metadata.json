@@ -1,0 +1,6 @@
+{
+  "name": "Checklist Operacional BlueN",
+  "description": "Guia e checklist interativo online para operadores conduzirem o processo industrial BlueN com controle de setpoints, batelada e ocorrências por fase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
