@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Check,
   RotateCcw,
@@ -20,6 +20,7 @@ import {
   Pause,
   Clock,
   Download,
+  Upload,
   Sliders,
   History,
   ArrowRight,
@@ -27,10 +28,23 @@ import {
   BarChart3,
   Eye,
   TrendingUp,
+  Cloud,
+  Share2,
+  RefreshCw,
 } from 'lucide-react';
+import {
+  db,
+  doc,
+  onSnapshot,
+  setDoc,
+  getDoc,
+  OperationType,
+  handleFirestoreError,
+} from './firebase';
 
 interface OdCascadeParams {
   currentOd: number;
+  referenceOd: number;
   currentRpm: number;
   currentAeration: number;
   currentPressure: number;
@@ -90,6 +104,8 @@ interface BatchState {
   cultivationTracker: CultivationTrackerState;
   twoHourLogs: Record<number, TwoHourRecord>;
   o2Modifications: O2ModificationRecord[];
+  lastPersistedAt?: string;
+  updatedAtMs?: number;
 }
 
 // Parâmetros Iniciais e Limites Máximos Oficiais do Processo BlueN
@@ -103,6 +119,7 @@ const PROCESS_LIMITS = {
   INITIAL_TEMP: 28.0,
   MAX_TEMP: 29.0,
   OD_MIN: 35,
+  OD_COMFORT_MIN: 37, // A partir de 36% (e 35%) já recomenda ajuste leve imediato!
   OD_MAX: 40,
   OD_TARGET_MID: 37.5,
 };
@@ -110,7 +127,33 @@ const PROCESS_LIMITS = {
 const TWO_HOURS_SECONDS = 2 * 60 * 60;
 const TWO_HOUR_SLOTS = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
 
-const STORAGE_KEY = 'bluen_o2_parameter_control_v7_saas';
+const PRIMARY_STORAGE_KEY = 'bluen_persistent_batch_state_v1';
+const LEGACY_STORAGE_KEYS = [
+  'bluen_o2_parameter_control_v7_saas',
+  'bluen_o2_parameter_control_v6',
+  'bluen_o2_parameter_control_v5',
+];
+const DEVICE_ID_STORAGE_KEY = 'bluen_device_session_id';
+const FIRESTORE_COLLECTION = 'bioprocessBatches';
+const FIRESTORE_DOC_ID = 'active_batch';
+
+const IDB_DB_NAME = 'BlueNBioprocessDB';
+const IDB_STORE_NAME = 'batch_state_store';
+const IDB_RECORD_KEY = 'active_batch';
+
+function getOrCreateDeviceId(): string {
+  try {
+    const existing = sessionStorage.getItem(DEVICE_ID_STORAGE_KEY);
+    if (existing) return existing;
+    const created = `dev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    sessionStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
+    return created;
+  } catch {
+    return `dev_${Math.random().toString(36).slice(2, 9)}`;
+  }
+}
+
+const CURRENT_DEVICE_ID = getOrCreateDeviceId();
 
 function formatCurrentTime(): string {
   const now = new Date();
@@ -154,7 +197,8 @@ function formatCountdownHms(totalSeconds: number): string {
 }
 
 const DEFAULT_OD_PARAMS: OdCascadeParams = {
-  currentOd: 28,
+  currentOd: 36,
+  referenceOd: 37,
   currentRpm: PROCESS_LIMITS.INITIAL_RPM,
   currentAeration: PROCESS_LIMITS.INITIAL_AERATION,
   currentPressure: PROCESS_LIMITS.INITIAL_PRESSURE,
@@ -175,8 +219,8 @@ function createDefaultTwoHourLogs(): Record<number, TwoHourRecord> {
     map[hr] = {
       hourMark: hr,
       recorded: hr === 0,
-      recordedAt: hr === 0 ? formatCurrentTime() : undefined,
-      od: hr === 0 ? 38.0 : 37.5,
+      recordedAt: hr === 0 ? formatCurrentTime() : '',
+      od: hr === 0 ? 37.0 : 37.0,
       rpm: PROCESS_LIMITS.INITIAL_RPM,
       aeration: PROCESS_LIMITS.INITIAL_AERATION,
       pressure: PROCESS_LIMITS.INITIAL_PRESSURE,
@@ -187,53 +231,256 @@ function createDefaultTwoHourLogs(): Record<number, TwoHourRecord> {
   return map;
 }
 
+// Calcula uma pontuação de uso real para saber qual dispositivo tem os dados mais completos da batelada
+function computeBatchActivityScore(state: Partial<BatchState> | Record<string, any>): number {
+  if (!state || typeof state !== 'object') return 0;
+  let score = 0;
+  if (Array.isArray(state.o2Modifications)) {
+    score += state.o2Modifications.length * 25;
+  }
+  if (state.twoHourLogs && typeof state.twoHourLogs === 'object') {
+    const recordedCount = TWO_HOUR_SLOTS.filter(
+      (hr) =>
+        hr > 0 &&
+        (state.twoHourLogs[hr]?.recorded || state.twoHourLogs[String(hr)]?.recorded)
+    ).length;
+    score += recordedCount * 15;
+  }
+  if (state.operatorName && String(state.operatorName).trim().length > 0) score += 10;
+  if (state.batchNumber && String(state.batchNumber).trim().length > 0) score += 10;
+  if (state.generalNotes && String(state.generalNotes).trim().length > 0) score += 5;
+  if ((state.cultivationTracker?.elapsedSeconds ?? 0) > 0) score += 8;
+  if ((state.odParams?.currentRpm ?? 95) !== 95) score += 5;
+  if ((state.odParams?.currentAeration ?? 50) !== 50) score += 5;
+  if ((state.odParams?.currentPressure ?? 0.6) !== 0.6) score += 5;
+  return score;
+}
+
+function hydrateParsedBatchState(parsed: Record<string, any>): BatchState {
+  const savedCultivation: CultivationTrackerState =
+    parsed.cultivationTracker ?? DEFAULT_CULTIVATION_TRACKER;
+  let computedElapsed = savedCultivation.elapsedSeconds ?? 0;
+
+  if (savedCultivation.isRunning && savedCultivation.lastTickTimestamp) {
+    const deltaSec = Math.max(
+      0,
+      Math.round((Date.now() - savedCultivation.lastTickTimestamp) / 1000)
+    );
+    computedElapsed += deltaSec;
+  }
+
+  const hydratedOdParams: OdCascadeParams = {
+    currentOd: Number(parsed.odParams?.currentOd ?? DEFAULT_OD_PARAMS.currentOd),
+    referenceOd: Number(parsed.odParams?.referenceOd ?? 37),
+    currentRpm: Math.min(
+      PROCESS_LIMITS.MAX_RPM,
+      Number(parsed.odParams?.currentRpm ?? DEFAULT_OD_PARAMS.currentRpm)
+    ),
+    currentAeration: Math.min(
+      PROCESS_LIMITS.MAX_AERATION,
+      Number(parsed.odParams?.currentAeration ?? DEFAULT_OD_PARAMS.currentAeration)
+    ),
+    currentPressure: Math.min(
+      PROCESS_LIMITS.MAX_PRESSURE,
+      Number(parsed.odParams?.currentPressure ?? DEFAULT_OD_PARAMS.currentPressure)
+    ),
+    currentTemp: Number(parsed.odParams?.currentTemp ?? DEFAULT_OD_PARAMS.currentTemp),
+  };
+
+  const defaultLogs = createDefaultTwoHourLogs();
+  const rawLogs = parsed.twoHourLogs ?? defaultLogs;
+  const hydratedTwoHourLogs: Record<number, TwoHourRecord> = {};
+
+  TWO_HOUR_SLOTS.forEach((hr) => {
+    const item = rawLogs[hr] ?? rawLogs[String(hr)] ?? defaultLogs[hr];
+    hydratedTwoHourLogs[hr] = {
+      hourMark: hr,
+      recorded: Boolean(item?.recorded),
+      recordedAt: item?.recordedAt ? String(item.recordedAt) : '',
+      od: Number(item?.od ?? 37.0),
+      rpm: Number(item?.rpm ?? PROCESS_LIMITS.INITIAL_RPM),
+      aeration: Number(item?.aeration ?? PROCESS_LIMITS.INITIAL_AERATION),
+      pressure: Number(item?.pressure ?? PROCESS_LIMITS.INITIAL_PRESSURE),
+      temp: Number(item?.temp ?? PROCESS_LIMITS.INITIAL_TEMP),
+      note: item?.note ? String(item.note) : '',
+    };
+  });
+
+  if (savedCultivation.isRunning && (savedCultivation.autoLogEvery2h ?? true)) {
+    TWO_HOUR_SLOTS.forEach((slotHour) => {
+      const slotSeconds = slotHour * 3600;
+      if (
+        slotHour > 0 &&
+        computedElapsed >= slotSeconds &&
+        !hydratedTwoHourLogs[slotHour]?.recorded
+      ) {
+        hydratedTwoHourLogs[slotHour] = {
+          hourMark: slotHour,
+          recorded: true,
+          recordedAt: formatCurrentTime(),
+          od: hydratedOdParams.currentOd,
+          rpm: hydratedOdParams.currentRpm,
+          aeration: hydratedOdParams.currentAeration,
+          pressure: hydratedOdParams.currentPressure,
+          temp: hydratedOdParams.currentTemp,
+          note: 'Registro automático de 2h',
+        };
+      }
+    });
+  }
+
+  return {
+    operatorName: String(parsed.operatorName ?? '').slice(0, 120),
+    batchNumber: String(parsed.batchNumber ?? '').slice(0, 80),
+    tankId: String(parsed.tankId ?? 'Reator BlueN-01').slice(0, 80),
+    startedAt: String(parsed.startedAt ?? formatCurrentDateTime()).slice(0, 60),
+    generalNotes: String(parsed.generalNotes ?? '').slice(0, 3000),
+    odParams: hydratedOdParams,
+    cultivationTracker: {
+      isRunning: Boolean(savedCultivation.isRunning),
+      elapsedSeconds: Math.max(0, Math.min(864000, Math.floor(computedElapsed))),
+      lastTickTimestamp: savedCultivation.isRunning ? Date.now() : null,
+      startedClockTime: savedCultivation.startedClockTime
+        ? String(savedCultivation.startedClockTime).slice(0, 30)
+        : null,
+      autoLogEvery2h: Boolean(savedCultivation.autoLogEvery2h ?? true),
+    },
+    twoHourLogs: hydratedTwoHourLogs,
+    o2Modifications: Array.isArray(parsed.o2Modifications)
+      ? parsed.o2Modifications.slice(0, 200)
+      : [],
+    lastPersistedAt:
+      parsed.updatedAtClient ?? parsed.lastPersistedAt ?? formatCurrentTimeWithSeconds(),
+    updatedAtMs: Number(parsed.updatedAtMs ?? 0),
+  };
+}
+
+function buildFirestorePayload(state: BatchState) {
+  const cleanTwoHourLogs: Record<string, any> = {};
+  TWO_HOUR_SLOTS.forEach((hr) => {
+    const rec = state.twoHourLogs[hr];
+    cleanTwoHourLogs[String(hr)] = {
+      hourMark: hr,
+      recorded: Boolean(rec?.recorded),
+      recordedAt: String(rec?.recordedAt ?? ''),
+      od: Number(rec?.od ?? 37.0),
+      rpm: Number(rec?.rpm ?? PROCESS_LIMITS.INITIAL_RPM),
+      aeration: Number(rec?.aeration ?? PROCESS_LIMITS.INITIAL_AERATION),
+      pressure: Number(rec?.pressure ?? PROCESS_LIMITS.INITIAL_PRESSURE),
+      temp: Number(rec?.temp ?? PROCESS_LIMITS.INITIAL_TEMP),
+      note: String(rec?.note ?? ''),
+    };
+  });
+
+  const cleanModifications = state.o2Modifications.slice(0, 200).map((m) => ({
+    id: String(m.id ?? ''),
+    timestamp: String(m.timestamp ?? ''),
+    cultivationElapsed: String(m.cultivationElapsed ?? ''),
+    operatorName: String(m.operatorName ?? 'Operador').slice(0, 120),
+    triggerOd: Number(m.triggerOd ?? 37),
+    estimatedOdAfter: Number(m.estimatedOdAfter ?? 37),
+    stageLabel: String(m.stageLabel ?? ''),
+    prevRpm: Number(m.prevRpm ?? 95),
+    newRpm: Number(m.newRpm ?? 95),
+    deltaRpm: Number(m.deltaRpm ?? 0),
+    prevAeration: Number(m.prevAeration ?? 50),
+    newAeration: Number(m.newAeration ?? 50),
+    deltaAeration: Number(m.deltaAeration ?? 0),
+    prevPressure: Number(m.prevPressure ?? 0.6),
+    newPressure: Number(m.newPressure ?? 0.6),
+    deltaPressure: Number(m.deltaPressure ?? 0),
+    prevTemp: Number(m.prevTemp ?? 28),
+    newTemp: Number(m.newTemp ?? 28),
+    summary: String(m.summary ?? ''),
+    operatorNote: String(m.operatorNote ?? ''),
+  }));
+
+  const nowClock = formatCurrentTimeWithSeconds();
+  const nowMs = Date.now();
+
+  return {
+    operatorName: String(state.operatorName ?? '').slice(0, 120),
+    batchNumber: String(state.batchNumber ?? '').slice(0, 80),
+    tankId: String(state.tankId ?? 'Reator BlueN-01').slice(0, 80),
+    startedAt: String(state.startedAt ?? formatCurrentDateTime()).slice(0, 60),
+    generalNotes: String(state.generalNotes ?? '').slice(0, 3000),
+    odParams: {
+      currentOd: Math.max(0, Math.min(100, Number(state.odParams.currentOd ?? 36))),
+      referenceOd: Math.max(0, Math.min(100, Number(state.odParams.referenceOd ?? 37))),
+      currentRpm: Math.max(0, Math.min(230, Number(state.odParams.currentRpm ?? 95))),
+      currentAeration: Math.max(0, Math.min(200, Number(state.odParams.currentAeration ?? 50))),
+      currentPressure: Math.max(0, Math.min(0.85, Number(state.odParams.currentPressure ?? 0.6))),
+      currentTemp: Math.max(0, Math.min(60, Number(state.odParams.currentTemp ?? 28))),
+    },
+    cultivationTracker: {
+      isRunning: Boolean(state.cultivationTracker.isRunning),
+      elapsedSeconds: Math.max(
+        0,
+        Math.min(864000, Math.floor(Number(state.cultivationTracker.elapsedSeconds ?? 0)))
+      ),
+      lastTickTimestamp: state.cultivationTracker.isRunning ? nowMs : null,
+      startedClockTime: state.cultivationTracker.startedClockTime
+        ? String(state.cultivationTracker.startedClockTime).slice(0, 30)
+        : null,
+      autoLogEvery2h: Boolean(state.cultivationTracker.autoLogEvery2h ?? true),
+    },
+    twoHourLogs: cleanTwoHourLogs,
+    o2Modifications: cleanModifications,
+    updatedAtClient: nowClock,
+    updatedAtMs: nowMs,
+    updatedByDevice: CURRENT_DEVICE_ID,
+  };
+}
+
+function saveBatchToIndexedDB(state: BatchState): void {
+  if (typeof window === 'undefined' || !('indexedDB' in window)) return;
+  try {
+    const request = window.indexedDB.open(IDB_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const idb = request.result;
+      if (!idb.objectStoreNames.contains(IDB_STORE_NAME)) {
+        idb.createObjectStore(IDB_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => {
+      const idb = request.result;
+      const tx = idb.transaction(IDB_STORE_NAME, 'readwrite');
+      tx.objectStore(IDB_STORE_NAME).put(state, IDB_RECORD_KEY);
+      tx.oncomplete = () => idb.close();
+    };
+  } catch {
+    // ignore IndexedDB errors
+  }
+}
+
+function persistStateLocally(state: BatchState): void {
+  try {
+    const payload = JSON.stringify({
+      ...state,
+      cultivationTracker: {
+        ...state.cultivationTracker,
+        lastTickTimestamp: state.cultivationTracker.isRunning ? Date.now() : null,
+      },
+      lastPersistedAt: formatCurrentTimeWithSeconds(),
+    });
+    localStorage.setItem(PRIMARY_STORAGE_KEY, payload);
+    localStorage.setItem(LEGACY_STORAGE_KEYS[0], payload);
+  } catch {
+    // ignore storage quota errors
+  }
+  saveBatchToIndexedDB(state);
+}
+
 function getInitialState(): BatchState {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (parsed && typeof parsed === 'object') {
-        const savedCultivation: CultivationTrackerState =
-          parsed.cultivationTracker ?? DEFAULT_CULTIVATION_TRACKER;
-        let computedElapsed = savedCultivation.elapsedSeconds ?? 0;
-        if (savedCultivation.isRunning && savedCultivation.lastTickTimestamp) {
-          const deltaSec = Math.max(
-            0,
-            Math.round((Date.now() - savedCultivation.lastTickTimestamp) / 1000)
-          );
-          computedElapsed += deltaSec;
+    const allKeysToCheck = [PRIMARY_STORAGE_KEY, ...LEGACY_STORAGE_KEYS];
+    for (const key of allKeysToCheck) {
+      const saved = localStorage.getItem(key);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') {
+          return hydrateParsedBatchState(parsed);
         }
-
-        return {
-          operatorName: parsed.operatorName ?? '',
-          batchNumber: parsed.batchNumber ?? '',
-          tankId: parsed.tankId ?? 'Reator BlueN-01',
-          startedAt: parsed.startedAt ?? formatCurrentDateTime(),
-          generalNotes: parsed.generalNotes ?? '',
-          odParams: {
-            currentOd: parsed.odParams?.currentOd ?? DEFAULT_OD_PARAMS.currentOd,
-            currentRpm: Math.min(
-              PROCESS_LIMITS.MAX_RPM,
-              parsed.odParams?.currentRpm ?? DEFAULT_OD_PARAMS.currentRpm
-            ),
-            currentAeration: Math.min(
-              PROCESS_LIMITS.MAX_AERATION,
-              parsed.odParams?.currentAeration ?? DEFAULT_OD_PARAMS.currentAeration
-            ),
-            currentPressure: Math.min(
-              PROCESS_LIMITS.MAX_PRESSURE,
-              parsed.odParams?.currentPressure ?? DEFAULT_OD_PARAMS.currentPressure
-            ),
-            currentTemp: parsed.odParams?.currentTemp ?? DEFAULT_OD_PARAMS.currentTemp,
-          },
-          cultivationTracker: {
-            ...savedCultivation,
-            elapsedSeconds: computedElapsed,
-            lastTickTimestamp: savedCultivation.isRunning ? Date.now() : null,
-          },
-          twoHourLogs: parsed.twoHourLogs ?? createDefaultTwoHourLogs(),
-          o2Modifications: Array.isArray(parsed.o2Modifications) ? parsed.o2Modifications : [],
-        };
       }
     }
   } catch {
@@ -249,6 +496,8 @@ function getInitialState(): BatchState {
     cultivationTracker: DEFAULT_CULTIVATION_TRACKER,
     twoHourLogs: createDefaultTwoHourLogs(),
     o2Modifications: [],
+    lastPersistedAt: formatCurrentTimeWithSeconds(),
+    updatedAtMs: 0,
   };
 }
 
@@ -355,7 +604,6 @@ function TelemetryLineChart({
 
   return (
     <div className="bg-[#090D16] border border-slate-800/90 rounded-xl p-4 flex flex-col justify-between space-y-3">
-      {/* Cabeçalho do Gráfico */}
       <div className="flex flex-wrap items-start justify-between gap-2 border-b border-slate-800/80 pb-3">
         <div>
           <h4 className="text-sm font-bold text-white flex items-center gap-2">
@@ -368,12 +616,13 @@ function TelemetryLineChart({
           <p className="text-[11px] text-slate-400 mt-0.5">{subtitle}</p>
         </div>
 
-        {/* Leitura em destaque do ponto selecionado ou último */}
         {activePoint && (
           <div className="text-right font-mono tabular-nums">
             <div className="flex items-center justify-end gap-2">
               <span className="text-[11px] text-slate-400">
-                {hoveredIdx !== null ? `Selecionado (${activePoint.label}):` : `Último (${activePoint.label}):`}
+                {hoveredIdx !== null
+                  ? `Selecionado (${activePoint.label}):`
+                  : `Último (${activePoint.label}):`}
               </span>
               <span className="text-base font-bold text-white">
                 {formatValue(activePoint.value)} {unit}
@@ -388,7 +637,6 @@ function TelemetryLineChart({
         )}
       </div>
 
-      {/* Área SVG do Gráfico */}
       <div className="relative w-full overflow-x-auto">
         <svg
           viewBox={`0 0 ${svgWidth} ${svgHeight}`}
@@ -403,7 +651,6 @@ function TelemetryLineChart({
             </linearGradient>
           </defs>
 
-          {/* Linhas Horizontais de Grade + Eixo Y */}
           {yTicks.map((tickVal, idx) => {
             const yPos = clampY(tickVal);
             return (
@@ -429,7 +676,6 @@ function TelemetryLineChart({
             );
           })}
 
-          {/* Faixa Alvo Sombreada (Ex: Meta O2 35% - 40% ou Temp 28 - 29°C) */}
           {targetBand && (
             <g>
               <rect
@@ -471,7 +717,6 @@ function TelemetryLineChart({
             </g>
           )}
 
-          {/* Linha de Partida Inicial */}
           {initialLine && (
             <g>
               <line
@@ -493,7 +738,6 @@ function TelemetryLineChart({
             </g>
           )}
 
-          {/* Linha de Limite Máximo */}
           {limitLine && (
             <g>
               <line
@@ -516,10 +760,10 @@ function TelemetryLineChart({
             </g>
           )}
 
-          {/* Área Preenchida Principal */}
-          {pointsCoords.length > 1 && <polygon points={areaPoints} fill={`url(#${fillGradientId})`} />}
+          {pointsCoords.length > 1 && (
+            <polygon points={areaPoints} fill={`url(#${fillGradientId})`} />
+          )}
 
-          {/* Linha Secundária (Ex: O2 Pós-Ajuste) */}
           {secondaryPolylinePoints && pointsCoords.length > 1 && (
             <polyline
               fill="none"
@@ -530,7 +774,6 @@ function TelemetryLineChart({
             />
           )}
 
-          {/* Linha Principal */}
           {pointsCoords.length > 1 && (
             <polyline
               fill="none"
@@ -542,7 +785,6 @@ function TelemetryLineChart({
             />
           )}
 
-          {/* Pontos + Rótulos + Hover Interativo */}
           {pointsCoords.map((pt, idx) => {
             const isHovered = hoveredIdx === idx;
             return (
@@ -552,7 +794,6 @@ function TelemetryLineChart({
                 onMouseLeave={() => setHoveredIdx(null)}
                 className="cursor-pointer"
               >
-                {/* Linha vertical guia no hover */}
                 {isHovered && (
                   <line
                     x1={pt.x}
@@ -565,7 +806,6 @@ function TelemetryLineChart({
                   />
                 )}
 
-                {/* Ponto secundário se existir */}
                 {pt.secY !== undefined && (
                   <circle
                     cx={pt.x}
@@ -577,7 +817,6 @@ function TelemetryLineChart({
                   />
                 )}
 
-                {/* Ponto Principal */}
                 <circle
                   cx={pt.x}
                   cy={pt.y}
@@ -587,7 +826,6 @@ function TelemetryLineChart({
                   strokeWidth={isHovered ? 3 : 2.2}
                 />
 
-                {/* Valor numérico direto acima do ponto */}
                 <text
                   x={pt.x}
                   y={pt.y - 10}
@@ -599,7 +837,6 @@ function TelemetryLineChart({
                   {formatValue(pt.raw.value)}
                 </text>
 
-                {/* Rótulo do Eixo X */}
                 <text
                   x={pt.x}
                   y={padTop + plotHeight + 16}
@@ -622,7 +859,6 @@ function TelemetryLineChart({
                   </text>
                 )}
 
-                {/* Área invisível maior para facilitar o mouse hover */}
                 <rect
                   x={pt.x - 18}
                   y={padTop}
@@ -636,7 +872,6 @@ function TelemetryLineChart({
         </svg>
       </div>
 
-      {/* Rodapé com legenda rápida e nota do ponto selecionado */}
       <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] font-mono text-slate-400 border-t border-slate-800/60">
         <div className="flex flex-wrap items-center gap-4">
           <span className="flex items-center gap-1.5">
@@ -673,13 +908,174 @@ export default function App() {
   const [editingSlotHour, setEditingSlotHour] = useState<number | null>(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
 
-  useEffect(() => {
+  // Estado de sincronização em nuvem (Firebase Firestore em Tempo Real)
+  const [cloudStatus, setCloudStatus] = useState<'connecting' | 'synced' | 'error'>('connecting');
+  const [lastCloudSyncTime, setLastCloudSyncTime] = useState<string>(() =>
+    formatCurrentTimeWithSeconds()
+  );
+  const [copiedLinkNotice, setCopiedLinkNotice] = useState<boolean>(false);
+
+  const latestBatchRef = useRef<BatchState>(batch);
+  const hasLoadedInitialCloudRef = useRef<boolean>(false);
+  const debounceSyncTimerRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Envia o estado atual diretamente para o documento compartilhado no Firestore
+  const pushBatchToFirestore = async (stateToSync: BatchState) => {
+    const docPath = `${FIRESTORE_COLLECTION}/${FIRESTORE_DOC_ID}`;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(batch));
-    } catch {
-      // ignore storage errors
+      const payload = buildFirestorePayload(stateToSync);
+      await setDoc(doc(db, FIRESTORE_COLLECTION, FIRESTORE_DOC_ID), payload);
+      setCloudStatus('synced');
+      setLastCloudSyncTime(payload.updatedAtClient);
+    } catch (error) {
+      setCloudStatus('error');
+      handleFirestoreError(error, OperationType.WRITE, docPath);
     }
-  }, [batch]);
+  };
+
+  // Helper centralizado para qualquer alteração feita pelo usuário:
+  // Atualiza a tela na hora, grava no dispositivo e envia imediatamente para a nuvem (todos os dispositivos recebem via onSnapshot)
+  const commitUserBatchUpdate = (
+    updater: (prev: BatchState) => BatchState,
+    options?: { immediateCloudPush?: boolean }
+  ) => {
+    setBatch((prev) => {
+      const next = {
+        ...updater(prev),
+        updatedAtMs: Date.now(),
+      };
+      latestBatchRef.current = next;
+      persistStateLocally(next);
+
+      if (debounceSyncTimerRef.current) {
+        window.clearTimeout(debounceSyncTimerRef.current);
+      }
+
+      if (options?.immediateCloudPush) {
+        pushBatchToFirestore(next);
+      } else {
+        debounceSyncTimerRef.current = window.setTimeout(() => {
+          pushBatchToFirestore(latestBatchRef.current);
+        }, 120);
+      }
+
+      return next;
+    });
+  };
+
+  // Força sincronização manual caso o operador queira puxar/enviar na hora
+  const handleManualCloudSync = async () => {
+    const docPath = `${FIRESTORE_COLLECTION}/${FIRESTORE_DOC_ID}`;
+    try {
+      setCloudStatus('connecting');
+      const snap = await getDoc(doc(db, FIRESTORE_COLLECTION, FIRESTORE_DOC_ID));
+      if (snap.exists()) {
+        const cloudData = snap.data();
+        const cloudScore = computeBatchActivityScore(cloudData);
+        const localScore = computeBatchActivityScore(latestBatchRef.current);
+
+        if (localScore > cloudScore) {
+          await pushBatchToFirestore(latestBatchRef.current);
+        } else {
+          const hydrated = hydrateParsedBatchState(cloudData);
+          latestBatchRef.current = hydrated;
+          setBatch(hydrated);
+          persistStateLocally(hydrated);
+          setManualO2Input(String(hydrated.odParams.currentOd).replace('.', ','));
+          setCloudStatus('synced');
+          setLastCloudSyncTime(cloudData.updatedAtClient || formatCurrentTimeWithSeconds());
+        }
+      } else {
+        await pushBatchToFirestore(latestBatchRef.current);
+      }
+    } catch (error) {
+      setCloudStatus('error');
+      handleFirestoreError(error, OperationType.GET, docPath);
+    }
+  };
+
+  // Listener em Tempo Real (onSnapshot) para que TODOS os dispositivos vejam exatamente a mesma tela
+  useEffect(() => {
+    const docRef = doc(db, FIRESTORE_COLLECTION, FIRESTORE_DOC_ID);
+    const docPath = `${FIRESTORE_COLLECTION}/${FIRESTORE_DOC_ID}`;
+
+    const unsubscribe = onSnapshot(
+      docRef,
+      (snapshot) => {
+        setCloudStatus('synced');
+        if (snapshot.exists()) {
+          const cloudData = snapshot.data();
+
+          // Na primeira leitura ao abrir a página, verifica se este dispositivo (ex: tablet do operador)
+          // já tinha mais dados locais do que um documento vazio na nuvem
+          if (!hasLoadedInitialCloudRef.current) {
+            hasLoadedInitialCloudRef.current = true;
+            const localScore = computeBatchActivityScore(latestBatchRef.current);
+            const cloudScore = computeBatchActivityScore(cloudData);
+
+            if (localScore > cloudScore && cloudScore === 0) {
+              // Publica os dados existentes do operador para a nuvem para que todos vejam
+              pushBatchToFirestore(latestBatchRef.current);
+              return;
+            }
+
+            const hydrated = hydrateParsedBatchState(cloudData);
+            latestBatchRef.current = hydrated;
+            setBatch(hydrated);
+            persistStateLocally(hydrated);
+            setManualO2Input(String(hydrated.odParams.currentOd).replace('.', ','));
+            setLastCloudSyncTime(cloudData.updatedAtClient || formatCurrentTimeWithSeconds());
+            return;
+          }
+
+          // Nas atualizações em tempo real seguintes vindas de qualquer dispositivo
+          if (cloudData.updatedByDevice !== CURRENT_DEVICE_ID) {
+            const hydrated = hydrateParsedBatchState(cloudData);
+            latestBatchRef.current = hydrated;
+            setBatch(hydrated);
+            persistStateLocally(hydrated);
+            setManualO2Input(String(hydrated.odParams.currentOd).replace('.', ','));
+            setLastCloudSyncTime(cloudData.updatedAtClient || formatCurrentTimeWithSeconds());
+          }
+        } else if (!hasLoadedInitialCloudRef.current) {
+          hasLoadedInitialCloudRef.current = true;
+          pushBatchToFirestore(latestBatchRef.current);
+        }
+      },
+      (error) => {
+        setCloudStatus('error');
+        handleFirestoreError(error, OperationType.GET, docPath);
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  // Garante gravação imediata ao fechar a aba, atualizar a página ou minimizar no tablet
+  useEffect(() => {
+    const handleFlushOnClose = () => {
+      persistStateLocally(latestBatchRef.current);
+      if (hasLoadedInitialCloudRef.current) {
+        pushBatchToFirestore(latestBatchRef.current);
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleFlushOnClose();
+      }
+    };
+
+    window.addEventListener('beforeunload', handleFlushOnClose);
+    window.addEventListener('pagehide', handleFlushOnClose);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('beforeunload', handleFlushOnClose);
+      window.removeEventListener('pagehide', handleFlushOnClose);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, []);
 
   useEffect(() => {
     const parsedCurrent = parseFloat(manualO2Input.replace(',', '.'));
@@ -699,6 +1095,7 @@ export default function App() {
         if (!prev.cultivationTracker.isRunning) return prev;
         const nextElapsed = prev.cultivationTracker.elapsedSeconds + 1;
         const nextTwoHourLogs = { ...prev.twoHourLogs };
+        let crossedTwoHourMark = false;
 
         if (prev.cultivationTracker.autoLogEvery2h) {
           TWO_HOUR_SLOTS.forEach((slotHour) => {
@@ -708,6 +1105,7 @@ export default function App() {
               nextElapsed >= slotSeconds &&
               !nextTwoHourLogs[slotHour]?.recorded
             ) {
+              crossedTwoHourMark = true;
               nextTwoHourLogs[slotHour] = {
                 hourMark: slotHour,
                 recorded: true,
@@ -723,7 +1121,7 @@ export default function App() {
           });
         }
 
-        return {
+        const nextState: BatchState = {
           ...prev,
           cultivationTracker: {
             ...prev.cultivationTracker,
@@ -732,11 +1130,31 @@ export default function App() {
           },
           twoHourLogs: nextTwoHourLogs,
         };
+
+        latestBatchRef.current = nextState;
+        persistStateLocally(nextState);
+
+        // Sincroniza na nuvem quando cruza uma janela de 2h ou a cada 15 segundos de cultivo ativo
+        if (crossedTwoHourMark || nextElapsed % 15 === 0) {
+          pushBatchToFirestore(nextState);
+        }
+
+        return nextState;
       });
     }, 1000);
 
     return () => window.clearInterval(interval);
   }, [batch.cultivationTracker.isRunning]);
+
+  const handleCopySharedLink = () => {
+    try {
+      navigator.clipboard.writeText(window.location.href);
+      setCopiedLinkNotice(true);
+      window.setTimeout(() => setCopiedLinkNotice(false), 4000);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const handleManualO2TextChange = (rawText: string) => {
     setManualO2Input(rawText);
@@ -745,7 +1163,7 @@ export default function App() {
     const numeric = parseFloat(normalized);
     if (!Number.isNaN(numeric)) {
       const clamped = Math.max(0, Math.min(100, numeric));
-      setBatch((prev) => ({
+      commitUserBatchUpdate((prev) => ({
         ...prev,
         odParams: {
           ...prev.odParams,
@@ -757,104 +1175,116 @@ export default function App() {
 
   const startCultivationTracker = () => {
     const nowTime = formatCurrentTime();
-    setBatch((prev) => {
-      const updatedTwoHour = { ...prev.twoHourLogs };
-      if (!updatedTwoHour[0]?.recorded) {
-        updatedTwoHour[0] = {
-          hourMark: 0,
-          recorded: true,
-          recordedAt: nowTime,
-          od: prev.odParams.currentOd,
-          rpm: prev.odParams.currentRpm,
-          aeration: prev.odParams.currentAeration,
-          pressure: prev.odParams.currentPressure,
-          temp: prev.odParams.currentTemp,
-          note: 'Partida do cultivo (0h)',
-        };
-      }
+    commitUserBatchUpdate(
+      (prev) => {
+        const updatedTwoHour = { ...prev.twoHourLogs };
+        if (!updatedTwoHour[0]?.recorded) {
+          updatedTwoHour[0] = {
+            hourMark: 0,
+            recorded: true,
+            recordedAt: nowTime,
+            od: prev.odParams.currentOd,
+            rpm: prev.odParams.currentRpm,
+            aeration: prev.odParams.currentAeration,
+            pressure: prev.odParams.currentPressure,
+            temp: prev.odParams.currentTemp,
+            note: 'Partida do cultivo (0h)',
+          };
+        }
 
-      return {
-        ...prev,
-        cultivationTracker: {
-          ...prev.cultivationTracker,
-          isRunning: true,
-          lastTickTimestamp: Date.now(),
-          startedClockTime: prev.cultivationTracker.startedClockTime ?? nowTime,
-        },
-        twoHourLogs: updatedTwoHour,
-      };
-    });
+        return {
+          ...prev,
+          cultivationTracker: {
+            ...prev.cultivationTracker,
+            isRunning: true,
+            lastTickTimestamp: Date.now(),
+            startedClockTime: prev.cultivationTracker.startedClockTime ?? nowTime,
+          },
+          twoHourLogs: updatedTwoHour,
+        };
+      },
+      { immediateCloudPush: true }
+    );
   };
 
   const pauseCultivationTracker = () => {
-    setBatch((prev) => ({
-      ...prev,
-      cultivationTracker: {
-        ...prev.cultivationTracker,
-        isRunning: false,
-        lastTickTimestamp: null,
-      },
-    }));
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        cultivationTracker: {
+          ...prev.cultivationTracker,
+          isRunning: false,
+          lastTickTimestamp: null,
+        },
+      }),
+      { immediateCloudPush: true }
+    );
   };
 
   const recordNextTwoHourSlotNow = () => {
     const nowTime = formatCurrentTime();
-    setBatch((prev) => {
-      const nextUnrecordedSlot = TWO_HOUR_SLOTS.find((hr) => !prev.twoHourLogs[hr]?.recorded);
-      if (nextUnrecordedSlot === undefined) {
-        return prev;
-      }
+    commitUserBatchUpdate(
+      (prev) => {
+        const nextUnrecordedSlot = TWO_HOUR_SLOTS.find((hr) => !prev.twoHourLogs[hr]?.recorded);
+        if (nextUnrecordedSlot === undefined) {
+          return prev;
+        }
 
-      const updatedTwoHour = {
-        ...prev.twoHourLogs,
-        [nextUnrecordedSlot]: {
-          hourMark: nextUnrecordedSlot,
-          recorded: true,
-          recordedAt: nowTime,
-          od: prev.odParams.currentOd,
-          rpm: prev.odParams.currentRpm,
-          aeration: prev.odParams.currentAeration,
-          pressure: prev.odParams.currentPressure,
-          temp: prev.odParams.currentTemp,
-          note: `Reporte de ${nextUnrecordedSlot}h registrado pelo operador`,
-        },
-      };
+        const updatedTwoHour = {
+          ...prev.twoHourLogs,
+          [nextUnrecordedSlot]: {
+            hourMark: nextUnrecordedSlot,
+            recorded: true,
+            recordedAt: nowTime,
+            od: prev.odParams.currentOd,
+            rpm: prev.odParams.currentRpm,
+            aeration: prev.odParams.currentAeration,
+            pressure: prev.odParams.currentPressure,
+            temp: prev.odParams.currentTemp,
+            note: `Reporte de ${nextUnrecordedSlot}h registrado pelo operador`,
+          },
+        };
 
-      const minElapsedForSlot = nextUnrecordedSlot * 3600;
-      const nextElapsed = Math.max(prev.cultivationTracker.elapsedSeconds, minElapsedForSlot);
+        const minElapsedForSlot = nextUnrecordedSlot * 3600;
+        const nextElapsed = Math.max(prev.cultivationTracker.elapsedSeconds, minElapsedForSlot);
 
-      return {
-        ...prev,
-        cultivationTracker: {
-          ...prev.cultivationTracker,
-          elapsedSeconds: nextElapsed,
-          startedClockTime: prev.cultivationTracker.startedClockTime ?? nowTime,
-        },
-        twoHourLogs: updatedTwoHour,
-      };
-    });
+        return {
+          ...prev,
+          cultivationTracker: {
+            ...prev.cultivationTracker,
+            elapsedSeconds: nextElapsed,
+            startedClockTime: prev.cultivationTracker.startedClockTime ?? nowTime,
+          },
+          twoHourLogs: updatedTwoHour,
+        };
+      },
+      { immediateCloudPush: true }
+    );
   };
 
   const recordSpecificTwoHourSlot = (hourMark: number) => {
     const nowTime = formatCurrentTime();
-    setBatch((prev) => ({
-      ...prev,
-      twoHourLogs: {
-        ...prev.twoHourLogs,
-        [hourMark]: {
-          ...prev.twoHourLogs[hourMark],
-          hourMark,
-          recorded: true,
-          recordedAt: nowTime,
-          od: prev.odParams.currentOd,
-          rpm: prev.odParams.currentRpm,
-          aeration: prev.odParams.currentAeration,
-          pressure: prev.odParams.currentPressure,
-          temp: prev.odParams.currentTemp,
-          note: prev.twoHourLogs[hourMark]?.note || `Reporte ${hourMark}h`,
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        twoHourLogs: {
+          ...prev.twoHourLogs,
+          [hourMark]: {
+            ...prev.twoHourLogs[hourMark],
+            hourMark,
+            recorded: true,
+            recordedAt: nowTime,
+            od: prev.odParams.currentOd,
+            rpm: prev.odParams.currentRpm,
+            aeration: prev.odParams.currentAeration,
+            pressure: prev.odParams.currentPressure,
+            temp: prev.odParams.currentTemp,
+            note: prev.twoHourLogs[hourMark]?.note || `Reporte ${hourMark}h`,
+          },
         },
-      },
-    }));
+      }),
+      { immediateCloudPush: true }
+    );
   };
 
   const updateTwoHourSlotField = (
@@ -862,7 +1292,7 @@ export default function App() {
     field: keyof TwoHourRecord,
     value: number | string | boolean
   ) => {
-    setBatch((prev) => ({
+    commitUserBatchUpdate((prev) => ({
       ...prev,
       twoHourLogs: {
         ...prev.twoHourLogs,
@@ -870,36 +1300,43 @@ export default function App() {
           ...prev.twoHourLogs[hourMark],
           [field]: value,
           recorded: true,
-          recordedAt: prev.twoHourLogs[hourMark]?.recordedAt ?? formatCurrentTime(),
+          recordedAt: prev.twoHourLogs[hourMark]?.recordedAt || formatCurrentTime(),
         },
       },
     }));
   };
 
   const clearTwoHourSlot = (hourMark: number) => {
-    setBatch((prev) => ({
-      ...prev,
-      twoHourLogs: {
-        ...prev.twoHourLogs,
-        [hourMark]: {
-          hourMark,
-          recorded: false,
-          recordedAt: undefined,
-          od: 37.5,
-          rpm: PROCESS_LIMITS.INITIAL_RPM,
-          aeration: PROCESS_LIMITS.INITIAL_AERATION,
-          pressure: PROCESS_LIMITS.INITIAL_PRESSURE,
-          temp: PROCESS_LIMITS.INITIAL_TEMP,
-          note: '',
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        twoHourLogs: {
+          ...prev.twoHourLogs,
+          [hourMark]: {
+            hourMark,
+            recorded: false,
+            recordedAt: '',
+            od: 37.0,
+            rpm: PROCESS_LIMITS.INITIAL_RPM,
+            aeration: PROCESS_LIMITS.INITIAL_AERATION,
+            pressure: PROCESS_LIMITS.INITIAL_PRESSURE,
+            temp: PROCESS_LIMITS.INITIAL_TEMP,
+            note: '',
+          },
         },
-      },
-    }));
+      }),
+      { immediateCloudPush: true }
+    );
     if (editingSlotHour === hourMark) {
       setEditingSlotHour(null);
     }
   };
 
-  const updateOdParam = (key: keyof OdCascadeParams, value: number) => {
+  const updateOdParam = (
+    key: keyof OdCascadeParams,
+    value: number,
+    immediateCloudPush = false
+  ) => {
     const cleanVal = Number.isNaN(value) ? 0 : value;
     let clamped = cleanVal;
     if (key === 'currentRpm') {
@@ -912,18 +1349,34 @@ export default function App() {
       clamped = Math.max(0, Math.min(100, cleanVal));
     }
 
-    setBatch((prev) => ({
-      ...prev,
-      odParams: {
-        ...prev.odParams,
-        [key]: clamped,
-      },
-    }));
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        odParams: {
+          ...prev.odParams,
+          [key]: clamped,
+        },
+      }),
+      { immediateCloudPush }
+    );
   };
 
-  // Cálculo em Cascata de Oxigênio Dissolvido (O2 / OD 35% – 40%)
+  // ==========================================================================
+  // CÁLCULO EM CASCATA DE O₂:
+  // - O₂ ≥ 37%: Estável (Manter)
+  // - O₂ em 36% (36,0% a 36,9%): Já recomenda Ajuste Leve imediato (+5 RPM / +5 L/min / +0,025 bar)
+  // - O₂ em 35% (35,0% a 35,9%): Já recomenda Ajuste Leve/Preventivo (+10 RPM / +10 L/min / +0,025 bar)
+  // - O₂ ≤ 34,9% (34%, 30%, 28%...): Cascata Corretiva Proporcional
+  // ==========================================================================
   const cascadeCalculation = useMemo(() => {
-    const { currentOd, currentRpm, currentAeration, currentPressure, currentTemp } = batch.odParams;
+    const {
+      currentOd,
+      currentRpm,
+      currentAeration,
+      currentPressure,
+      currentTemp,
+    } = batch.odParams;
+
     const {
       MAX_RPM,
       MAX_AERATION,
@@ -931,6 +1384,7 @@ export default function App() {
       INITIAL_TEMP,
       MAX_TEMP,
       OD_MIN,
+      OD_COMFORT_MIN,
       OD_MAX,
       OD_TARGET_MID,
     } = PROCESS_LIMITS;
@@ -941,12 +1395,14 @@ export default function App() {
 
     const isTempWithinBand = currentTemp >= INITIAL_TEMP && currentTemp <= MAX_TEMP;
 
-    if (currentOd >= OD_MIN) {
+    // Somente quando O2 >= 37% considera estável sem recomendação de subida
+    if (currentOd >= OD_COMFORT_MIN) {
       return {
         isNominal: true,
+        isPreventiveFineAdjustment: false,
         deficitOd: 0,
         activeStage: 'maintain' as const,
-        stageLabel: 'Manutenção Nominal',
+        stageLabel: 'Manutenção Nominal (O₂ ≥ 37%)',
         atRpmMax: currentRpm >= MAX_RPM,
         atAerationMax: currentAeration >= MAX_AERATION,
         atPressureMax: currentPressure >= MAX_PRESSURE,
@@ -958,17 +1414,29 @@ export default function App() {
         recommendedPressure: currentPressure,
         isTempWithinBand,
         estimatedFinalOd: currentOd,
-        operatorActionHeadline: 'MANTER CONDIÇÕES ATUAIS (O₂ ≥ 35%)',
+        operatorActionHeadline: 'MANTER CONDIÇÕES ATUAIS (O₂ ESTÁVEL ≥ 37%)',
       };
     }
 
-    const totalDeficit = Math.max(0, Number((OD_TARGET_MID - currentOd).toFixed(1)));
+    // Qualquer valor entre 35,0% e 36,9% já aciona o Ajuste Leve Preventivo!
+    const isPreventiveFineAdjustment = currentOd >= OD_MIN && currentOd < OD_COMFORT_MIN;
+    const totalDeficit = Math.max(0.5, Number((OD_TARGET_MID - currentOd).toFixed(1)));
     let remainingDeficit = totalDeficit;
 
     // 1º PASSO: Agitação (95 -> 230 RPM)
     const availableRpmHeadroom = Math.max(0, MAX_RPM - currentRpm);
-    const neededRpm = Math.ceil(remainingDeficit / odGainPerRpm);
-    const deltaRpm = Math.min(availableRpmHeadroom, neededRpm);
+    const rawNeededRpm = Math.ceil(remainingDeficit / odGainPerRpm);
+    let steppedNeededRpm = Math.max(5, Math.ceil(rawNeededRpm / 5) * 5);
+
+    // Em 36% (36,0 a 36,9%): recomenda ajuste leve imediato de +5 RPM
+    // Em 35% (35,0 a 35,9%): recomenda ajuste preventivo imediato de +10 RPM
+    if (currentOd >= 36 && currentOd < 37) {
+      steppedNeededRpm = 5;
+    } else if (currentOd >= 35 && currentOd < 36) {
+      steppedNeededRpm = 10;
+    }
+
+    const deltaRpm = Math.min(availableRpmHeadroom, steppedNeededRpm);
     const recommendedRpm = currentRpm + deltaRpm;
     const odCoveredByRpm = deltaRpm * odGainPerRpm;
     remainingDeficit = Math.max(0, remainingDeficit - odCoveredByRpm);
@@ -983,8 +1451,14 @@ export default function App() {
 
     if (stillNeedsAfterRpm || currentRpm >= MAX_RPM) {
       const availableAerationHeadroom = Math.max(0, MAX_AERATION - currentAeration);
-      const neededAeration = Math.ceil(remainingDeficit / odGainPerAeration);
-      deltaAeration = Math.min(availableAerationHeadroom, neededAeration);
+      const rawNeededAeration = Math.ceil(remainingDeficit / odGainPerAeration);
+      let steppedNeededAeration = Math.max(5, Math.ceil(rawNeededAeration / 5) * 5);
+      if (currentRpm >= MAX_RPM && currentOd >= 36 && currentOd < 37) {
+        steppedNeededAeration = 5;
+      } else if (currentRpm >= MAX_RPM && currentOd >= 35 && currentOd < 36) {
+        steppedNeededAeration = 10;
+      }
+      deltaAeration = Math.min(availableAerationHeadroom, steppedNeededAeration);
       recommendedAeration = currentAeration + deltaAeration;
       odCoveredByAeration = deltaAeration * odGainPerAeration;
       remainingDeficit = Math.max(0, remainingDeficit - odCoveredByAeration);
@@ -995,12 +1469,20 @@ export default function App() {
     let recommendedPressure = currentPressure;
     let odCoveredByPressure = 0;
     const stillNeedsAfterAeration =
-      (stillNeedsAfterRpm || currentRpm >= MAX_RPM) && remainingDeficit > 0.2;
+      (stillNeedsAfterRpm || currentRpm >= MAX_RPM) &&
+      (recommendedAeration >= MAX_AERATION || currentAeration >= MAX_AERATION) &&
+      remainingDeficit > 0.2;
 
     if (stillNeedsAfterAeration) {
       const availablePressureHeadroom = Math.max(0, MAX_PRESSURE - currentPressure);
-      const neededPressure = Number((remainingDeficit / odGainPerPressure).toFixed(3));
-      deltaPressure = Number(Math.min(availablePressureHeadroom, neededPressure).toFixed(3));
+      const rawSteps = Math.max(1, Math.ceil(remainingDeficit / (0.025 * odGainPerPressure)));
+      let steppedNeededPressure = Number((rawSteps * 0.025).toFixed(3));
+      if (currentOd >= 35 && currentOd < 37) {
+        steppedNeededPressure = 0.025;
+      }
+      deltaPressure = Number(
+        Math.min(availablePressureHeadroom, steppedNeededPressure).toFixed(3)
+      );
       recommendedPressure = Number((currentPressure + deltaPressure).toFixed(3));
       odCoveredByPressure = deltaPressure * odGainPerPressure;
       remainingDeficit = Math.max(0, remainingDeficit - odCoveredByPressure);
@@ -1009,34 +1491,45 @@ export default function App() {
     const estimatedFinalOd = Number(
       Math.min(
         OD_MAX,
-        currentOd + odCoveredByRpm + odCoveredByAeration + odCoveredByPressure
+        Math.max(37, currentOd + odCoveredByRpm + odCoveredByAeration + odCoveredByPressure)
       ).toFixed(1)
     );
 
+    const modePrefix = isPreventiveFineAdjustment ? 'AJUSTE LEVE RECOMENDADO' : 'CASCATA CORRETIVA';
+
     let activeStage: 'agitation' | 'aeration' | 'pressure' = 'agitation';
-    let stageLabel = '1º Cascata · Agitação (RPM)';
-    let operatorActionHeadline = `1º PASSO: SUBIR AGITAÇÃO EM +${deltaRpm} RPM (IR PARA ${recommendedRpm} RPM)`;
+    let stageLabel = isPreventiveFineAdjustment
+      ? 'Ajuste Leve · 1º Agitação (RPM)'
+      : '1º Cascata · Agitação (RPM)';
+    let operatorActionHeadline = `${modePrefix} (1º PASSO): SUBIR AGITAÇÃO EM +${deltaRpm} RPM (IR PARA ${recommendedRpm} RPM)`;
 
     if (deltaAeration > 0) {
       activeStage = 'aeration';
       stageLabel =
-        deltaRpm > 0 ? '1º Agitação + 2º Vazão de Ar' : '2º Cascata · Vazão de Ar (L/min)';
+        deltaRpm > 0
+          ? '1º Agitação + 2º Vazão de Ar'
+          : isPreventiveFineAdjustment
+          ? 'Ajuste Leve · 2º Vazão de Ar (L/min)'
+          : '2º Cascata · Vazão de Ar (L/min)';
       operatorActionHeadline =
         deltaRpm > 0
           ? `1º SUBIR RPM ATÉ 230 + 2º SUBIR VAZÃO DE AR (+${deltaAeration} L/min)`
-          : `2º PASSO (RPM MAX): SUBIR VAZÃO DE AR EM +${deltaAeration} L/min`;
+          : `${modePrefix} (2º PASSO · RPM MÁX): SUBIR VAZÃO DE AR EM +${deltaAeration} L/min (IR PARA ${recommendedAeration} L/min)`;
     }
 
     if (deltaPressure > 0 || (stillNeedsAfterAeration && currentAeration >= MAX_AERATION)) {
       activeStage = 'pressure';
-      stageLabel = '3º Cascata · Pressão (bar)';
-      operatorActionHeadline = `3º PASSO: SUBIR PRESSÃO EM +${formatPressure(
+      stageLabel = isPreventiveFineAdjustment
+        ? 'Ajuste Leve · 3º Pressão (bar)'
+        : '3º Cascata · Pressão (bar)';
+      operatorActionHeadline = `${modePrefix} (3º PASSO): SUBIR PRESSÃO EM +${formatPressure(
         deltaPressure
       )} bar (IR PARA ${formatPressure(recommendedPressure)} bar)`;
     }
 
     return {
       isNominal: false,
+      isPreventiveFineAdjustment,
       deficitOd: totalDeficit,
       activeStage,
       stageLabel,
@@ -1055,7 +1548,7 @@ export default function App() {
     };
   }, [batch.odParams]);
 
-  // Função central que aplica e SALVA no histórico de modificações com base no O2
+  // Função central que aplica e SALVA no histórico de modificações com base no O2 e transmite na nuvem
   const applyAndLogO2Modification = (customTarget?: {
     newRpm?: number;
     newAeration?: number;
@@ -1104,13 +1597,15 @@ export default function App() {
     }
 
     const nowClock = formatCurrentTimeWithSeconds();
+    const nextOd = customTarget ? triggerOd : cascadeCalculation.estimatedFinalOd;
+
     const record: O2ModificationRecord = {
       id: `mod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       timestamp: nowClock,
       cultivationElapsed: `T+ ${formatCountdownHms(batch.cultivationTracker.elapsedSeconds)}`,
-      operatorName: batch.operatorName.trim() || 'Operador de Turno',
+      operatorName: batch.operatorName.trim() || 'Operador (Tablet)',
       triggerOd,
-      estimatedOdAfter: customTarget ? triggerOd : cascadeCalculation.estimatedFinalOd,
+      estimatedOdAfter: nextOd,
       stageLabel: customTarget?.customStageLabel ?? cascadeCalculation.stageLabel,
       prevRpm,
       newRpm,
@@ -1124,36 +1619,43 @@ export default function App() {
       prevTemp,
       newTemp,
       summary: parts.join(' · '),
-      operatorNote: modificationReasonInput.trim() || undefined,
+      operatorNote: modificationReasonInput.trim() || '',
     };
 
-    const nextOd = customTarget ? triggerOd : cascadeCalculation.estimatedFinalOd;
-
-    setBatch((prev) => ({
-      ...prev,
-      odParams: {
-        currentOd: nextOd,
-        currentRpm: newRpm,
-        currentAeration: newAeration,
-        currentPressure: newPressure,
-        currentTemp: newTemp,
-      },
-      o2Modifications: [record, ...prev.o2Modifications],
-    }));
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        odParams: {
+          currentOd: nextOd,
+          referenceOd: Math.max(37, nextOd),
+          currentRpm: newRpm,
+          currentAeration: newAeration,
+          currentPressure: newPressure,
+          currentTemp: newTemp,
+        },
+        o2Modifications: [record, ...prev.o2Modifications].slice(0, 200),
+      }),
+      { immediateCloudPush: true }
+    );
 
     setManualO2Input(String(nextOd).replace('.', ','));
     setModificationReasonInput('');
-    setLastSavedBanner(`Modificação salva às ${nowClock}: ${record.summary}`);
+    setLastSavedBanner(
+      `Sincronizado na nuvem às ${nowClock}: ${record.summary} (visível em todos os dispositivos)`
+    );
     window.setTimeout(() => {
       setLastSavedBanner(null);
     }, 5000);
   };
 
   const deleteModificationRecord = (id: string) => {
-    setBatch((prev) => ({
-      ...prev,
-      o2Modifications: prev.o2Modifications.filter((m) => m.id !== id),
-    }));
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        o2Modifications: prev.o2Modifications.filter((m) => m.id !== id),
+      }),
+      { immediateCloudPush: true }
+    );
   };
 
   const resetToInitialParameters = () => {
@@ -1177,10 +1679,53 @@ export default function App() {
       cultivationTracker: DEFAULT_CULTIVATION_TRACKER,
       twoHourLogs: createDefaultTwoHourLogs(),
       o2Modifications: [],
+      lastPersistedAt: formatCurrentTimeWithSeconds(),
+      updatedAtMs: Date.now(),
     };
+    latestBatchRef.current = fresh;
     setBatch(fresh);
+    persistStateLocally(fresh);
+    pushBatchToFirestore(fresh);
     setManualO2Input(String(DEFAULT_OD_PARAMS.currentOd));
     setShowResetConfirm(false);
+  };
+
+  const exportFullBackupJson = () => {
+    const dataStr =
+      'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(batch, null, 2));
+    const link = document.createElement('a');
+    link.setAttribute('href', dataStr);
+    link.setAttribute('download', `Backup_BlueN_${batch.batchNumber || 'Batelada'}.json`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleImportBackupJson = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const parsed = JSON.parse(String(e.target?.result || '{}'));
+        if (parsed && typeof parsed === 'object') {
+          const hydrated = {
+            ...hydrateParsedBatchState(parsed),
+            updatedAtMs: Date.now(),
+          };
+          latestBatchRef.current = hydrated;
+          setBatch(hydrated);
+          persistStateLocally(hydrated);
+          pushBatchToFirestore(hydrated);
+          setManualO2Input(String(hydrated.odParams.currentOd).replace('.', ','));
+          setLastSavedBanner('Backup restaurado e sincronizado na nuvem para todos os dispositivos!');
+        }
+      } catch {
+        // ignore invalid json
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
   };
 
   const exportTwoHourCsv = () => {
@@ -1286,8 +1831,8 @@ export default function App() {
     const initialPoint = {
       label: 'Partida',
       sublabel: '0h',
-      odTrigger: 38.0,
-      odAfter: 38.0,
+      odTrigger: 37.0,
+      odAfter: 37.0,
       rpm: PROCESS_LIMITS.INITIAL_RPM,
       aeration: PROCESS_LIMITS.INITIAL_AERATION,
       pressure: PROCESS_LIMITS.INITIAL_PRESSURE,
@@ -1307,7 +1852,6 @@ export default function App() {
       note: `${mod.timestamp} (${mod.cultivationElapsed}) — ${mod.summary}`,
     }));
 
-    // Se ainda não houver ajustes salvos, exibe a Partida e o Estado Atual em tela
     if (mapped.length === 0) {
       return [
         initialPoint,
@@ -1366,15 +1910,48 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#090D16] text-slate-100 selection:bg-sky-500/30">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,application/json"
+        onChange={handleImportBackupJson}
+        className="hidden"
+      />
+
       {/* =======================================================================
-          HEADER CORPORATIVO SAAS COM SELETOR DE ABAS (OPERAÇÃO vs GRÁFICOS)
+          HEADER CORPORATIVO SAAS COM SINCRONIZAÇÃO EM TEMPO REAL NA NUVEM
          ======================================================================= */}
       <header className="sticky top-0 z-30 bg-[#090D16]/95 backdrop-blur-md border-b border-slate-800/90 no-print">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          {/* Brand Wordmark */}
-          <div className="text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0 flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-xs bg-sky-400" />
-            <span>BlueN Parameter Control</span>
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
+          {/* Brand Wordmark + Indicador de Nuvem Ao Vivo */}
+          <div className="flex items-center gap-2.5 shrink-0">
+            <div className="text-base font-bold tracking-tight text-white whitespace-nowrap flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-xs bg-sky-400" />
+              <span>BlueN Control</span>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleManualCloudSync}
+              title="Clique para sincronizar imediatamente com a nuvem — todos os dispositivos no link veem a mesma tela"
+              className={`hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded border text-[11px] font-mono cursor-pointer transition-colors ${
+                cloudStatus === 'synced'
+                  ? 'bg-emerald-950/60 border-emerald-600/50 text-emerald-300 hover:bg-emerald-900/60'
+                  : cloudStatus === 'connecting'
+                  ? 'bg-sky-950/60 border-sky-600/50 text-sky-300'
+                  : 'bg-amber-950/60 border-amber-600/50 text-amber-300'
+              }`}
+            >
+              <Cloud className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                {cloudStatus === 'synced'
+                  ? `Nuvem Ao Vivo (${lastCloudSyncTime})`
+                  : cloudStatus === 'connecting'
+                  ? 'Sincronizando...'
+                  : 'Tentar Sincronizar'}
+              </span>
+              <RefreshCw className="w-3 h-3 ml-0.5 opacity-80" />
+            </button>
           </div>
 
           {/* Seletor de Abas Principal: Operação vs Gráficos (Apenas Visualização) */}
@@ -1382,44 +1959,77 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('operacao')}
-              className={`inline-flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+              className={`inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                 activeTab === 'operacao'
                   ? 'bg-sky-400 text-slate-950'
                   : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
               }`}
             >
               <Sliders className="w-3.5 h-3.5" />
-              <span>Operação &amp; Controle O₂</span>
+              <span>Operação (Tablet)</span>
             </button>
 
             <button
               type="button"
               onClick={() => setActiveTab('graficos')}
-              className={`inline-flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+              className={`inline-flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                 activeTab === 'graficos'
                   ? 'bg-sky-400 text-slate-950'
                   : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
               }`}
             >
               <BarChart3 className="w-3.5 h-3.5" />
-              <span>Gráficos de Parâmetros (Visualização)</span>
+              <span>Gráficos (Visualização)</span>
             </button>
           </div>
 
-          {/* Primary Actions */}
-          <div className="flex items-center gap-2.5 shrink-0">
+          {/* Ações Rápidas: Compartilhar Link, Backup, Imprimir, Nova Batelada */}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleCopySharedLink}
+              title="Copiar link para acompanhar os ajustes do tablet em tempo real de qualquer dispositivo"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-emerald-300 bg-emerald-950/60 hover:bg-emerald-900/70 border border-emerald-600/50 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Share2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden lg:inline">
+                {copiedLinkNotice ? 'Link Copiado!' : 'Compartilhar Link'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={exportFullBackupJson}
+              title="Baixar cópia completa dos dados da batelada"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5 text-sky-400" />
+              <span className="hidden xl:inline">Backup</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              title="Restaurar arquivo de backup JSON"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <Upload className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden xl:inline">Restaurar</span>
+            </button>
+
             <button
               type="button"
               onClick={() => window.print()}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
             >
               <Printer className="w-3.5 h-3.5 text-slate-400" />
               <span className="hidden sm:inline">Imprimir</span>
             </button>
+
             <button
               type="button"
               onClick={() => setShowResetConfirm(true)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Nova Batelada</span>
@@ -1439,15 +2049,17 @@ export default function App() {
         >
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-800/80">
             <div>
-              <div className="flex items-center gap-2 text-xs font-mono text-sky-400">
-                <span>CONTROLE OPERACIONAL DE BIOPROCESSO</span>
+              <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-sky-400">
+                <span>SINCRONIZAÇÃO EM TEMPO REAL (TODOS OS DISPOSITIVOS)</span>
                 <span>·</span>
-                <span>META O₂ DISSOLVIDO: 35% – 40%</span>
+                <span>ESTÁVEL: 37% – 40%</span>
+                <span>·</span>
+                <span className="text-amber-300">AJUSTE LEVE IMEDIATO: 36% (+5 RPM) E 35% (+10 RPM)</span>
               </div>
               <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight mt-1">
                 {activeTab === 'operacao'
-                  ? 'Controle de Parâmetros por O₂ Dissolvido & Rastreabilidade'
-                  : 'Painel de Gráficos — Evolução de O₂ e Parâmetros (Apenas Visualização)'}
+                  ? 'Controle de Parâmetros por O₂ Dissolvido & Rastreabilidade em Nuvem'
+                  : 'Painel de Gráficos em Tempo Real — Evolução de O₂ e Parâmetros'}
               </h1>
             </div>
 
@@ -1493,16 +2105,19 @@ export default function App() {
                 htmlFor="operator-name"
                 className="block text-xs font-medium text-slate-400 mb-1.5"
               >
-                Operador Responsável
+                Operador Responsável (Tablet)
               </label>
               <div className="relative">
                 <User className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   id="operator-name"
                   type="text"
+                  maxLength={120}
                   readOnly={activeTab === 'graficos'}
                   value={batch.operatorName}
-                  onChange={(e) => setBatch((prev) => ({ ...prev, operatorName: e.target.value }))}
+                  onChange={(e) =>
+                    commitUserBatchUpdate((prev) => ({ ...prev, operatorName: e.target.value }))
+                  }
                   placeholder="Nome ou matrícula"
                   className="w-full pl-9 pr-3 py-2 text-sm bg-[#090D16] border border-slate-800 rounded-lg text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-400 transition-colors"
                 />
@@ -1521,9 +2136,12 @@ export default function App() {
                 <input
                   id="batch-number"
                   type="text"
+                  maxLength={80}
                   readOnly={activeTab === 'graficos'}
                   value={batch.batchNumber}
-                  onChange={(e) => setBatch((prev) => ({ ...prev, batchNumber: e.target.value }))}
+                  onChange={(e) =>
+                    commitUserBatchUpdate((prev) => ({ ...prev, batchNumber: e.target.value }))
+                  }
                   placeholder="Ex: BLN-2026-042"
                   className="w-full pl-9 pr-3 py-2 text-sm font-mono tabular-nums bg-[#090D16] border border-slate-800 rounded-lg text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-400 transition-colors"
                 />
@@ -1540,9 +2158,12 @@ export default function App() {
               <input
                 id="tank-id"
                 type="text"
+                maxLength={80}
                 readOnly={activeTab === 'graficos'}
                 value={batch.tankId}
-                onChange={(e) => setBatch((prev) => ({ ...prev, tankId: e.target.value }))}
+                onChange={(e) =>
+                  commitUserBatchUpdate((prev) => ({ ...prev, tankId: e.target.value }))
+                }
                 placeholder="Ex: Reator BlueN-01"
                 className="w-full px-3 py-2 text-sm bg-[#090D16] border border-slate-800 rounded-lg text-white placeholder:text-slate-600 focus:outline-none focus:border-sky-400 transition-colors"
               />
@@ -1551,24 +2172,22 @@ export default function App() {
         </section>
 
         {/* =====================================================================
-            ABA 2: GRÁFICOS DE PARÂMETROS (APENAS VISUALIZAÇÃO)
+            ABA 2: GRÁFICOS DE PARÂMETROS (APENAS VISUALIZAÇÃO EM TEMPO REAL)
            ===================================================================== */}
         {activeTab === 'graficos' ? (
           <div className="space-y-8">
-            {/* Barra de Controle de Visualização + Resumo Instantâneo */}
             <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl p-6 space-y-5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
                 <div className="flex items-center gap-2.5">
                   <span className="px-2.5 py-1 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300 font-mono text-xs font-bold flex items-center gap-1.5">
                     <Eye className="w-3.5 h-3.5" />
-                    MODO APENAS VISUALIZAÇÃO
+                    VISUALIZAÇÃO AO VIVO (SINCRONIZADO EM TODOS OS DISPOSITIVOS)
                   </span>
                   <span className="text-xs text-slate-400">
-                    Passe o mouse sobre qualquer ponto do gráfico para inspecionar os valores exatos
+                    Qualquer ajuste salvo no tablet atualiza estes gráficos instantaneamente
                   </span>
                 </div>
 
-                {/* Filtro rápido de visualização */}
                 <div className="flex items-center gap-1.5 bg-[#090D16] p-1 rounded-lg border border-slate-800">
                   <button
                     type="button"
@@ -1612,12 +2231,12 @@ export default function App() {
                   <span className="text-[11px] text-slate-400 block">O₂ Dissolvido Atual</span>
                   <span
                     className={`text-xl font-bold ${
-                      batch.odParams.currentOd >= 35 ? 'text-emerald-400' : 'text-amber-400'
+                      batch.odParams.currentOd >= 37 ? 'text-emerald-400' : 'text-amber-400'
                     }`}
                   >
                     {String(batch.odParams.currentOd).replace('.', ',')}%
                   </span>
-                  <span className="text-[10px] text-slate-500 block">Meta: 35% – 40%</span>
+                  <span className="text-[10px] text-slate-500 block">Estável: 37% – 40%</span>
                 </div>
 
                 <div className="bg-[#090D16] border border-slate-800 rounded-lg p-3">
@@ -1656,9 +2275,7 @@ export default function App() {
               </div>
             </section>
 
-            {/* =================================================================
-                BLOCO A: GRÁFICOS A CADA AJUSTE DE O₂ (HISTÓRICO DE MODIFICAÇÕES)
-               ================================================================= */}
+            {/* BLOCO A: GRÁFICOS A CADA AJUSTE DE O₂ */}
             {(chartSourceFilter === 'ambos' || chartSourceFilter === 'ajustes') && (
               <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
                 <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
@@ -1683,10 +2300,9 @@ export default function App() {
                 </div>
 
                 <div className="p-6 space-y-5">
-                  {/* Gráfico Principal: Porcentagem de O2 a cada ajuste */}
                   <TelemetryLineChart
                     title="Porcentagem de O₂ Dissolvido a cada Ajuste (%)"
-                    subtitle="Linha sólida: O₂ lido que motivou o ajuste · Linha tracejada verde: O₂ estimado após o ajuste em cascata"
+                    subtitle="Linha sólida: O₂ lido que motivou o ajuste · Linha tracejada verde: O₂ estimado após o ajuste"
                     unit="%"
                     yMin={0}
                     yMax={55}
@@ -1705,7 +2321,6 @@ export default function App() {
                     }))}
                   />
 
-                  {/* Grade 2x2: Todos os Outros Parâmetros a cada Ajuste */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                     <TelemetryLineChart
                       title="1º Agitação a cada Ajuste (RPM)"
@@ -1788,9 +2403,7 @@ export default function App() {
               </section>
             )}
 
-            {/* =================================================================
-                BLOCO B: GRÁFICOS A CADA 2 HORAS (0h ATÉ 24h)
-               ================================================================= */}
+            {/* BLOCO B: GRÁFICOS A CADA 2 HORAS (0h ATÉ 24h) */}
             {(chartSourceFilter === 'ambos' || chartSourceFilter === '2h') && (
               <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
                 <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
@@ -1815,7 +2428,6 @@ export default function App() {
                 </div>
 
                 <div className="p-6 space-y-5">
-                  {/* Gráfico Principal: Porcentagem de O2 a cada 2h */}
                   <TelemetryLineChart
                     title="Porcentagem de O₂ Dissolvido a cada 2 Horas (0h – 24h)"
                     subtitle="Acompanhamento periódico de O₂ (%) registrado nas janelas de 2 em 2 horas"
@@ -1834,7 +2446,6 @@ export default function App() {
                     }))}
                   />
 
-                  {/* Grade 2x2: Todos os Outros Parâmetros a cada 2h */}
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
                     <TelemetryLineChart
                       title="1º Agitação a cada 2 Horas (RPM)"
@@ -1937,8 +2548,8 @@ export default function App() {
                       CONTROLE DE PARÂMETROS COM BASE NO OXIGÊNIO DISSOLVIDO (O₂)
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Digite o O₂ atual e clique em &quot;Aplicar e Salvar Modificação&quot; para
-                      atualizar os parâmetros e alimentar os gráficos
+                      Com 36% já recomenda ajuste leve (+5 RPM) e com 35% ajuste preventivo (+10
+                      RPM) · Sincronizado em todos os dispositivos
                     </p>
                   </div>
                 </div>
@@ -1964,7 +2575,6 @@ export default function App() {
               </div>
 
               <div className="p-6 space-y-5">
-                {/* Banner de confirmação quando uma modificação por O2 é salva */}
                 {lastSavedBanner && (
                   <div className="bg-emerald-950/60 border border-emerald-500/70 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs font-mono text-emerald-300">
                     <span>✓ {lastSavedBanner}</span>
@@ -1998,7 +2608,9 @@ export default function App() {
                         <Sliders className="w-3.5 h-3.5" />
                         Leitura Atual de O₂ Dissolvido (%)
                       </label>
-                      <span className="text-xs font-mono text-emerald-400">Meta: 35% – 40%</span>
+                      <span className="text-xs font-mono text-emerald-400">
+                        Estável: ≥ 37% · Ajuste Leve: 36%
+                      </span>
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -2009,7 +2621,7 @@ export default function App() {
                             0,
                             Number((batch.odParams.currentOd - 1).toFixed(1))
                           );
-                          updateOdParam('currentOd', next);
+                          updateOdParam('currentOd', next, true);
                           setManualO2Input(String(next).replace('.', ','));
                         }}
                         className="w-10 h-11 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-white font-mono text-lg font-bold cursor-pointer shrink-0"
@@ -2024,7 +2636,7 @@ export default function App() {
                           inputMode="decimal"
                           value={manualO2Input}
                           onChange={(e) => handleManualO2TextChange(e.target.value)}
-                          placeholder="28"
+                          placeholder="36"
                           className="w-full text-2xl sm:text-3xl font-mono tabular-nums font-bold text-white bg-[#111827] border border-sky-500/60 rounded-lg py-1.5 pl-3 pr-10 text-center focus:outline-none focus:border-sky-400"
                         />
                         <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm font-mono font-bold text-sky-400 pointer-events-none">
@@ -2039,7 +2651,7 @@ export default function App() {
                             100,
                             Number((batch.odParams.currentOd + 1).toFixed(1))
                           );
-                          updateOdParam('currentOd', next);
+                          updateOdParam('currentOd', next, true);
                           setManualO2Input(String(next).replace('.', ','));
                         }}
                         className="w-10 h-11 rounded-lg bg-slate-800/90 hover:bg-slate-700 text-white font-mono text-lg font-bold cursor-pointer shrink-0"
@@ -2048,18 +2660,20 @@ export default function App() {
                       </button>
                     </div>
 
-                    <div className="flex items-center justify-between gap-1.5 pt-1">
-                      {[20, 25, 28, 32, 36, 40].map((val) => (
+                    <div className="grid grid-cols-4 sm:grid-cols-8 gap-1.5 pt-1">
+                      {[25, 30, 34, 35, 36, 37, 38, 40].map((val) => (
                         <button
                           key={val}
                           type="button"
                           onClick={() => {
-                            updateOdParam('currentOd', val);
+                            updateOdParam('currentOd', val, true);
                             setManualO2Input(String(val));
                           }}
-                          className={`flex-1 py-1 text-xs font-mono tabular-nums font-semibold rounded border transition-colors cursor-pointer ${
+                          className={`py-1 text-xs font-mono tabular-nums font-semibold rounded border transition-colors cursor-pointer ${
                             batch.odParams.currentOd === val
                               ? 'bg-sky-400 text-slate-950 border-sky-400'
+                              : val === 35 || val === 36
+                              ? 'bg-amber-950/40 text-amber-300 border-amber-500/40 hover:bg-amber-900/50'
                               : 'bg-slate-900 text-slate-400 border-slate-800 hover:bg-slate-800 hover:text-slate-200'
                           }`}
                         >
@@ -2074,19 +2688,27 @@ export default function App() {
                     className={`lg:col-span-7 rounded-xl border p-4 flex flex-col justify-between gap-3 ${
                       cascadeCalculation.isNominal
                         ? 'bg-emerald-950/25 border-emerald-600/50'
+                        : cascadeCalculation.isPreventiveFineAdjustment
+                        ? 'bg-amber-950/25 border-amber-500/60'
                         : 'bg-sky-950/25 border-sky-500/50'
                     }`}
                   >
                     <div className="space-y-2">
-                      <div className="flex items-center justify-between">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
                         <span
                           className={`text-xs font-mono uppercase font-semibold ${
-                            cascadeCalculation.isNominal ? 'text-emerald-400' : 'text-amber-300'
+                            cascadeCalculation.isNominal
+                              ? 'text-emerald-400'
+                              : cascadeCalculation.isPreventiveFineAdjustment
+                              ? 'text-amber-300'
+                              : 'text-sky-300'
                           }`}
                         >
                           {cascadeCalculation.isNominal
-                            ? '✓ ESTÁVEL · NENHUM AJUSTE NECESSÁRIO'
-                            : `▲ DÉFICIT DE +${cascadeCalculation.deficitOd}% O₂ · AÇÃO RECOMENDADA`}
+                            ? '✓ ESTÁVEL (O₂ ≥ 37%) · NENHUM AJUSTE NECESSÁRIO'
+                            : cascadeCalculation.isPreventiveFineAdjustment
+                            ? `▲ O₂ EM ${batch.odParams.currentOd}% · AJUSTE LEVE PREVENTIVO IMEDIATO`
+                            : `▲ DÉFICIT CORRETIVO (+${cascadeCalculation.deficitOd}% O₂) · AÇÃO EM CASCATA`}
                         </span>
                         <span className="text-[11px] font-mono text-slate-400">
                           1º RPM → 2º Ar → 3º Pressão
@@ -2120,19 +2742,19 @@ export default function App() {
                         )}
                         {cascadeCalculation.isNominal && (
                           <span className="px-2.5 py-1 rounded bg-[#090D16] border border-emerald-700/50 font-mono text-xs text-emerald-300">
-                            Parâmetros dentro da meta operacional (35%–40%)
+                            Parâmetros dentro da zona ideal (37%–40%)
                           </span>
                         )}
                       </div>
                     </div>
 
-                    {/* Campo opcional de observação + Botão que aplica e grava no histórico de O2 */}
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 pt-2.5 border-t border-slate-800/80 no-print">
                       <input
                         type="text"
+                        maxLength={200}
                         value={modificationReasonInput}
                         onChange={(e) => setModificationReasonInput(e.target.value)}
-                        placeholder="Nota opcional desta modificação (ex: queda brusca de O₂)..."
+                        placeholder="Nota opcional desta modificação (ex: ajuste leve em 36% O₂)..."
                         className="flex-1 px-3 py-1.5 text-xs bg-[#090D16] border border-slate-800 rounded-lg text-white placeholder:text-slate-500 focus:outline-none focus:border-sky-400"
                       />
 
@@ -2142,6 +2764,8 @@ export default function App() {
                         className={`inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                           cascadeCalculation.isNominal
                             ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                            : cascadeCalculation.isPreventiveFineAdjustment
+                            ? 'bg-amber-400 hover:bg-amber-300 text-slate-950'
                             : 'bg-sky-400 hover:bg-sky-300 text-slate-950'
                         }`}
                       >
@@ -2175,10 +2799,12 @@ export default function App() {
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
-                        onClick={() => updateOdParam('currentRpm', batch.odParams.currentRpm - 10)}
+                        onClick={() =>
+                          updateOdParam('currentRpm', batch.odParams.currentRpm - 5, true)
+                        }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        -10
+                        -5
                       </button>
                       <input
                         type="number"
@@ -2191,14 +2817,16 @@ export default function App() {
                       />
                       <button
                         type="button"
-                        onClick={() => updateOdParam('currentRpm', batch.odParams.currentRpm + 10)}
+                        onClick={() =>
+                          updateOdParam('currentRpm', batch.odParams.currentRpm + 5, true)
+                        }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        +10
+                        +5
                       </button>
                       <button
                         type="button"
-                        onClick={() => updateOdParam('currentRpm', PROCESS_LIMITS.MAX_RPM)}
+                        onClick={() => updateOdParam('currentRpm', PROCESS_LIMITS.MAX_RPM, true)}
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 font-mono text-xs font-semibold cursor-pointer"
                       >
                         Máx
@@ -2263,11 +2891,15 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() =>
-                          updateOdParam('currentAeration', batch.odParams.currentAeration - 10)
+                          updateOdParam(
+                            'currentAeration',
+                            batch.odParams.currentAeration - 5,
+                            true
+                          )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        -10
+                        -5
                       </button>
                       <input
                         type="number"
@@ -2283,16 +2915,20 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() =>
-                          updateOdParam('currentAeration', batch.odParams.currentAeration + 10)
+                          updateOdParam(
+                            'currentAeration',
+                            batch.odParams.currentAeration + 5,
+                            true
+                          )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        +10
+                        +5
                       </button>
                       <button
                         type="button"
                         onClick={() =>
-                          updateOdParam('currentAeration', PROCESS_LIMITS.MAX_AERATION)
+                          updateOdParam('currentAeration', PROCESS_LIMITS.MAX_AERATION, true)
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 font-mono text-xs font-semibold cursor-pointer"
                       >
@@ -2362,12 +2998,13 @@ export default function App() {
                         onClick={() =>
                           updateOdParam(
                             'currentPressure',
-                            Number((batch.odParams.currentPressure - 0.05).toFixed(3))
+                            Number((batch.odParams.currentPressure - 0.025).toFixed(3)),
+                            true
                           )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        -0,05
+                        -0,025
                       </button>
                       <input
                         type="number"
@@ -2385,16 +3022,19 @@ export default function App() {
                         onClick={() =>
                           updateOdParam(
                             'currentPressure',
-                            Number((batch.odParams.currentPressure + 0.05).toFixed(3))
+                            Number((batch.odParams.currentPressure + 0.025).toFixed(3)),
+                            true
                           )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
-                        +0,05
+                        +0,025
                       </button>
                       <button
                         type="button"
-                        onClick={() => updateOdParam('currentPressure', PROCESS_LIMITS.MAX_PRESSURE)}
+                        onClick={() =>
+                          updateOdParam('currentPressure', PROCESS_LIMITS.MAX_PRESSURE, true)
+                        }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 font-mono text-xs font-semibold cursor-pointer"
                       >
                         Máx
@@ -2462,7 +3102,8 @@ export default function App() {
                         onClick={() =>
                           updateOdParam(
                             'currentTemp',
-                            Number((batch.odParams.currentTemp - 0.5).toFixed(1))
+                            Number((batch.odParams.currentTemp - 0.5).toFixed(1)),
+                            true
                           )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
@@ -2483,7 +3124,8 @@ export default function App() {
                         onClick={() =>
                           updateOdParam(
                             'currentTemp',
-                            Number((batch.odParams.currentTemp + 0.5).toFixed(1))
+                            Number((batch.odParams.currentTemp + 0.5).toFixed(1)),
+                            true
                           )
                         }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
@@ -2492,7 +3134,9 @@ export default function App() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => updateOdParam('currentTemp', PROCESS_LIMITS.INITIAL_TEMP)}
+                        onClick={() =>
+                          updateOdParam('currentTemp', PROCESS_LIMITS.INITIAL_TEMP, true)
+                        }
                         className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-xs font-semibold cursor-pointer"
                       >
                         28°
@@ -2537,7 +3181,7 @@ export default function App() {
                 {/* Regra da Cascata em 1 Linha */}
                 <div className="bg-[#090D16] border border-slate-800 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
                   <span className="text-slate-400 font-sans font-medium">
-                    Prioridade de Cascata (quando O₂ &lt; 35%):
+                    Prioridade de Cascata (a partir de O₂ ≤ 36%):
                   </span>
                   <div className="flex flex-wrap items-center gap-2">
                     <span
@@ -2595,8 +3239,7 @@ export default function App() {
                       </span>
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Registro automático de todas as alterações de Agitação, Vazão de Ar, Pressão e
-                      Temperatura motivadas pela leitura de O₂
+                      Sincronizado em tempo real para todos os dispositivos conectados ao link
                     </p>
                   </div>
                 </div>
@@ -2640,13 +3283,12 @@ export default function App() {
                       Nenhuma modificação por O₂ registrada ainda nesta batelada.
                     </p>
                     <p className="text-xs text-slate-500 max-w-lg mx-auto">
-                      Sempre que você digitar o valor de O₂ no painel acima e clicar em{' '}
+                      Sempre que o operador no tablet digitar o valor de O₂ e clicar em{' '}
                       <strong className="text-slate-300">
                         &quot;Aplicar e Salvar Modificação por O₂&quot;
-                      </strong>{' '}
-                      (ou no botão <strong className="text-slate-300">&quot;Salvar&quot;</strong> de
-                      qualquer cartão), o sistema guardará automaticamente o horário, o O₂ lido e os
-                      valores Antes → Depois aqui e atualizará os gráficos.
+                      </strong>
+                      , o ajuste aparecerá imediatamente aqui e nos gráficos para todos que
+                      acessarem o link.
                     </p>
                   </div>
                 ) : (
@@ -2677,7 +3319,7 @@ export default function App() {
                             <td className="py-3 px-3 text-right">
                               <span
                                 className={`inline-block font-bold px-2 py-0.5 rounded ${
-                                  mod.triggerOd < 35
+                                  mod.triggerOd < 37
                                     ? 'bg-amber-950/80 text-amber-300 border border-amber-500/40'
                                     : 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/40'
                                 }`}
@@ -2816,7 +3458,6 @@ export default function App() {
               </div>
 
               <div className="p-6 space-y-5">
-                {/* Barra Compacta de Telemetria de Tempo */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-[#090D16] border border-slate-800 rounded-xl p-4">
                   <div className="flex items-center justify-between sm:block">
                     <span className="text-xs text-slate-400 flex items-center gap-1.5">
@@ -2889,7 +3530,7 @@ export default function App() {
                               <td className="py-3 px-3 text-right font-bold">
                                 {isRecorded ? (
                                   <span
-                                    className={rec.od >= 35 ? 'text-emerald-400' : 'text-amber-400'}
+                                    className={rec.od >= 37 ? 'text-emerald-400' : 'text-amber-400'}
                                   >
                                     {rec.od}%
                                   </span>
@@ -2957,7 +3598,7 @@ export default function App() {
                                       <input
                                         type="number"
                                         step={0.5}
-                                        value={rec?.od ?? 37.5}
+                                        value={rec?.od ?? 37.0}
                                         onChange={(e) =>
                                           updateTwoHourSlotField(
                                             hr,
@@ -3044,6 +3685,7 @@ export default function App() {
                                   <div>
                                     <input
                                       type="text"
+                                      maxLength={250}
                                       placeholder="Observação deste horário..."
                                       value={rec?.note ?? ''}
                                       onChange={(e) =>
@@ -3073,8 +3715,11 @@ export default function App() {
                   <textarea
                     id="general-notes-textarea"
                     rows={2}
+                    maxLength={3000}
                     value={batch.generalNotes}
-                    onChange={(e) => setBatch((prev) => ({ ...prev, generalNotes: e.target.value }))}
+                    onChange={(e) =>
+                      commitUserBatchUpdate((prev) => ({ ...prev, generalNotes: e.target.value }))
+                    }
                     placeholder="Registre ocorrências relevantes ou recomendações para o próximo turno..."
                     className="w-full text-sm text-white placeholder:text-slate-600 bg-[#090D16] border border-slate-800 rounded-lg p-3 focus:outline-none focus:border-sky-400 resize-y"
                   />
@@ -3105,7 +3750,7 @@ export default function App() {
                 <p className="text-xs sm:text-sm text-slate-300 mt-1 leading-relaxed">
                   Isso limpará o histórico de modificações com base no O₂, a tabela de reporte de 2
                   em 2 horas e restaurará os parâmetros iniciais (95 RPM, 50 L/min, 0,600 bar e 28
-                  °C).
+                  °C) para todos os dispositivos conectados.
                 </p>
               </div>
             </div>
