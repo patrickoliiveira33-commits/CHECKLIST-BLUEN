@@ -1,0 +1,88 @@
+{
+  "entities": {
+    "BioprocessBatch": {
+      "title": "BioprocessBatch",
+      "description": "Estado em tempo real da batelada do biorreator BlueN sincronizado entre o tablet do operador e todos os visualizadores do link.",
+      "type": "object",
+      "properties": {
+        "operatorName": {
+          "type": "string",
+          "description": "Nome ou matrícula do operador responsável no tablet.",
+          "maxLength": 120
+        },
+        "batchNumber": {
+          "type": "string",
+          "description": "Código identificador do lote ou batelada.",
+          "maxLength": 80
+        },
+        "tankId": {
+          "type": "string",
+          "description": "Identificação do equipamento ou biorreator.",
+          "maxLength": 80
+        },
+        "startedAt": {
+          "type": "string",
+          "description": "Data e hora de início da batelada.",
+          "maxLength": 60
+        },
+        "generalNotes": {
+          "type": "string",
+          "description": "Observações gerais do cultivo e passagem de turno.",
+          "maxLength": 3000
+        },
+        "odParams": {
+          "type": "object",
+          "description": "Parâmetros atuais do controle em cascata de O2 dissolvido."
+        },
+        "cultivationTracker": {
+          "type": "object",
+          "description": "Estado do cronômetro de tempo de cultivo."
+        },
+        "twoHourLogs": {
+          "type": "object",
+          "description": "Registros periódicos de parâmetros a cada 2 horas (0h a 24h)."
+        },
+        "o2Modifications": {
+          "type": "array",
+          "description": "Lista histórica de modificações realizadas com base no O2 (máx 200 registros)."
+        },
+        "updatedAtClient": {
+          "type": "string",
+          "description": "Horário da última sincronização enviada pelo dispositivo.",
+          "maxLength": 60
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Timestamp numérico em milissegundos da última atualização."
+        },
+        "updatedByDevice": {
+          "type": "string",
+          "description": "Identificador curto da sessão/dispositivo que realizou a atualização.",
+          "maxLength": 80
+        }
+      },
+      "required": [
+        "operatorName",
+        "batchNumber",
+        "tankId",
+        "startedAt",
+        "generalNotes",
+        "odParams",
+        "cultivationTracker",
+        "twoHourLogs",
+        "o2Modifications",
+        "updatedAtClient",
+        "updatedAtMs",
+        "updatedByDevice"
+      ]
+    }
+  },
+  "firestore": {
+    "/bioprocessBatches/{batchId}": {
+      "schema": {
+        "$ref": "#/entities/BioprocessBatch"
+      },
+      "description": "Documento compartilhado em tempo real da batelada ativa (active_batch) para visualização e operação sincronizada via link."
+    }
+  }
+}
