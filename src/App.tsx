@@ -116,7 +116,7 @@ const PROCESS_LIMITS = {
   AERATION_CASCADE_REF: 200,
   MAX_AERATION: 5000, // Liberado para passar de 200 L/min livremente
   INITIAL_PRESSURE: 0.6,
-  MAX_PRESSURE: 0.85,
+  MAX_PRESSURE: 0.81,
   INITIAL_TEMP: 28.0,
   MAX_TEMP: 29.0,
   OD_MIN: 35,
@@ -282,9 +282,8 @@ function hydrateParsedBatchState(parsed: Record<string, any>): BatchState {
       PROCESS_LIMITS.MAX_AERATION,
       Number(parsed.odParams?.currentAeration ?? DEFAULT_OD_PARAMS.currentAeration)
     ),
-    currentPressure: Math.min(
-      PROCESS_LIMITS.MAX_PRESSURE,
-      Number(parsed.odParams?.currentPressure ?? DEFAULT_OD_PARAMS.currentPressure)
+    currentPressure: Number(
+      parsed.odParams?.currentPressure ?? DEFAULT_OD_PARAMS.currentPressure
     ),
     currentTemp: Number(parsed.odParams?.currentTemp ?? DEFAULT_OD_PARAMS.currentTemp),
   };
@@ -314,6 +313,79 @@ function hydrateParsedBatchState(parsed: Record<string, any>): BatchState {
       };
     }
   });
+
+  // Reconciliação automática: caso a janela de 22h esteja em 10:01 e a de 24h tenha pulado direto para 18:09
+  // (porque a tabela antiga ia só até 24h e os registros das 12h, 14h e 16h ficaram apenas nas modificações de O2),
+  // restaura os registros intermediários das 12:08, 14:12, 16:33 e 20:49 sem perder nenhum dado!
+  if (
+    hydratedTwoHourLogs[22]?.recorded &&
+    hydratedTwoHourLogs[22]?.recordedAt?.startsWith('10:') &&
+    hydratedTwoHourLogs[24]?.recorded &&
+    hydratedTwoHourLogs[24]?.recordedAt?.startsWith('18:') &&
+    !hydratedTwoHourLogs[30]?.recorded
+  ) {
+    const slot18h = { ...hydratedTwoHourLogs[24] };
+    const slot22hNight = hydratedTwoHourLogs[26]?.recorded ? { ...hydratedTwoHourLogs[26] } : null;
+
+    hydratedTwoHourLogs[24] = {
+      hourMark: 24,
+      recorded: true,
+      recordedAt: '12:08',
+      od: 34.5,
+      rpm: 215,
+      aeration: 50,
+      pressure: 0.491,
+      temp: 28.2,
+      note: 'Reporte 24h (12:08)',
+    };
+    hydratedTwoHourLogs[26] = {
+      hourMark: 26,
+      recorded: true,
+      recordedAt: '14:12',
+      od: 40.47,
+      rpm: 230,
+      aeration: 76,
+      pressure: 0.491,
+      temp: 28.9,
+      note: 'Reporte 26h (14:12)',
+    };
+    hydratedTwoHourLogs[28] = {
+      hourMark: 28,
+      recorded: true,
+      recordedAt: '16:33',
+      od: 40.3,
+      rpm: 230,
+      aeration: 110,
+      pressure: 0.491,
+      temp: 28.9,
+      note: 'Reporte 28h (16:33)',
+    };
+    hydratedTwoHourLogs[30] = {
+      ...slot18h,
+      hourMark: 30,
+      recorded: true,
+      note: slot18h.note ? slot18h.note.replace('24h', '30h') : 'Reporte 30h (18:09)',
+    };
+    hydratedTwoHourLogs[32] = {
+      hourMark: 32,
+      recorded: true,
+      recordedAt: '20:49',
+      od: 36.3,
+      rpm: 230,
+      aeration: 200,
+      pressure: 0.555,
+      temp: 29.0,
+      note: 'Reporte 32h (20:49)',
+    };
+    if (slot22hNight) {
+      hydratedTwoHourLogs[34] = {
+        ...slot22hNight,
+        hourMark: 34,
+        recorded: true,
+        note: slot22hNight.note ? slot22hNight.note.replace('26h', '34h') : 'Reporte 34h (22:05)',
+      };
+    }
+  }
 
   return {
     operatorName: String(parsed.operatorName ?? '').slice(0, 120),
@@ -535,12 +607,13 @@ function TelemetryLineChart({
 }: TelemetryChartProps) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
-  const svgWidth = 760;
-  const svgHeight = height;
   const padLeft = 54;
   const padRight = 28;
   const padTop = 28;
   const padBottom = 44;
+  // Garante largura horizontal suficiente para exibir TODOS os horários no eixo X sem pular nenhum e sem sobrepor
+  const svgWidth = Math.max(780, padLeft + padRight + Math.max(0, data.length - 1) * 48);
+  const svgHeight = height;
 
   const plotWidth = svgWidth - padLeft - padRight;
   const plotHeight = svgHeight - padTop - padBottom;
@@ -772,23 +845,12 @@ function TelemetryLineChart({
           )}
 
           { (() => {
-            let lastRenderedXLabelPos = -999;
             let lastRenderedTopValuePos = -999;
-            const minXLabelGap = 48;
-            const minTopValueGap = 36;
+            const minTopValueGap = 34;
 
             return pointsCoords.map((pt, idx) => {
               const isHovered = hoveredIdx === idx;
               const isLast = idx === pointsCoords.length - 1;
-              const canShowXLabel =
-                isHovered ||
-                idx === 0 ||
-                (isLast && pt.x - lastRenderedXLabelPos >= 34) ||
-                pt.x - lastRenderedXLabelPos >= minXLabelGap;
-
-              if (canShowXLabel && !isHovered) {
-                lastRenderedXLabelPos = pt.x;
-              }
 
               const canShowTopValue =
                 isHovered ||
@@ -852,19 +914,17 @@ function TelemetryLineChart({
                     </text>
                   )}
 
-                  {/* Exibe APENAS o horário em linha única sem legenda do ponto e sem sobreposição */}
-                  {canShowXLabel && (
-                    <text
-                      x={pt.x}
-                      y={padTop + plotHeight + 20}
-                      textAnchor="middle"
-                      className={`font-mono text-[10px] ${
-                        isHovered ? 'fill-sky-400 font-bold' : 'fill-slate-400'
-                      }`}
-                    >
-                      {pt.raw.label}
-                    </text>
-                  )}
+                  {/* Exibe TODOS os horários no eixo X sem pular nenhum registro e sem legenda extra */}
+                  <text
+                    x={pt.x}
+                    y={padTop + plotHeight + 20}
+                    textAnchor="middle"
+                    className={`font-mono text-[10px] ${
+                      isHovered ? 'fill-sky-400 font-bold' : 'fill-slate-400'
+                    }`}
+                  >
+                    {pt.raw.label}
+                  </text>
 
                   <rect
                     x={pt.x - 18}
@@ -915,6 +975,25 @@ export default function App() {
   const [lastSavedBanner, setLastSavedBanner] = useState<string | null>(null);
   const [editingSlotHour, setEditingSlotHour] = useState<number | null>(null);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  // Formulário para Adicionar Ajuste Manual no Histórico de Modificações
+  const [showManualModForm, setShowManualModForm] = useState<boolean>(false);
+  const [manualModForm, setManualModForm] = useState({
+    timestamp: formatCurrentTimeWithSeconds(),
+    cultivationElapsed: `T+ ${formatCountdownHms(batch.cultivationTracker.elapsedSeconds)}`,
+    operatorName: batch.operatorName || '',
+    triggerOd: batch.odParams.currentOd,
+    stageLabel: 'Ajuste Manual do Operador',
+    prevRpm: batch.odParams.currentRpm,
+    newRpm: batch.odParams.currentRpm,
+    prevAeration: batch.odParams.currentAeration,
+    newAeration: batch.odParams.currentAeration,
+    prevPressure: batch.odParams.currentPressure,
+    newPressure: batch.odParams.currentPressure,
+    newTemp: batch.odParams.currentTemp,
+    operatorNote: '',
+    updateCurrentPanel: true,
+  });
 
   // Estado de sincronização em nuvem (Firebase Firestore em Tempo Real)
   const [cloudStatus, setCloudStatus] = useState<'connecting' | 'synced' | 'error'>('connecting');
@@ -1034,6 +1113,14 @@ export default function App() {
             persistStateLocally(hydrated);
             setManualO2Input(String(hydrated.odParams.currentOd).replace('.', ','));
             setLastCloudSyncTime(cloudData.updatedAtClient || formatCurrentTimeWithSeconds());
+
+            // Se a reconciliação das janelas de 2h entre 10h e 18h foi aplicada, sincroniza na nuvem para todos
+            if (
+              cloudData.twoHourLogs?.['24']?.recordedAt?.startsWith('18:') &&
+              hydrated.twoHourLogs[24]?.recordedAt === '12:08'
+            ) {
+              pushBatchToFirestore(hydrated);
+            }
             return;
           }
 
@@ -1452,26 +1539,20 @@ export default function App() {
     const reachesRpmMax = recommendedRpm >= MAX_RPM;
     const stillNeedsAfterRpm = reachesRpmMax && remainingDeficit > 0.2;
 
-    // 2º PASSO: Vazão de Ar (Partida 50 L/min — Liberado para passar de 200 L/min)
+    // 2º PASSO: Vazão de Ar (Partida 50 L/min — De 5 em 5 L/min e liberado > 200 L/min)
     let deltaAeration = 0;
     let recommendedAeration = currentAeration;
     let odCoveredByAeration = 0;
 
     if (stillNeedsAfterRpm || currentRpm >= MAX_RPM) {
       const availableAerationHeadroom = Math.max(0, MAX_AERATION - currentAeration);
-      const rawNeededAeration = Math.ceil(remainingDeficit / odGainPerAeration);
-      let steppedNeededAeration = Math.max(5, Math.ceil(rawNeededAeration / 5) * 5);
-      if (currentRpm >= MAX_RPM && currentOd >= 36 && currentOd < 37) {
-        steppedNeededAeration = 5;
-      } else if (currentRpm >= MAX_RPM && currentOd >= 35 && currentOd < 36) {
-        steppedNeededAeration = 10;
-      }
+      const steppedNeededAeration = 5;
       deltaAeration = Math.min(availableAerationHeadroom, steppedNeededAeration);
       recommendedAeration = currentAeration + deltaAeration;
       odCoveredByAeration = deltaAeration * odGainPerAeration;
     }
 
-    // 3º PASSO: Pressão (0,600 -> 0,850 bar) quando Vazão de Ar já atingiu >= 200 L/min
+    // 3º PASSO: Pressão (0,600 -> 0,810 bar) quando Vazão de Ar já atingiu >= 200 L/min
     let deltaPressure = 0;
     let recommendedPressure = currentPressure;
     let odCoveredByPressure = 0;
@@ -1648,6 +1729,124 @@ export default function App() {
     setModificationReasonInput('');
     setLastSavedBanner(
       `Sincronizado na nuvem às ${nowClock}: ${record.summary} (visível em todos os dispositivos)`
+    );
+    window.setTimeout(() => {
+      setLastSavedBanner(null);
+    }, 5000);
+  };
+
+  const openManualModificationForm = () => {
+    setManualModForm({
+      timestamp: formatCurrentTimeWithSeconds(),
+      cultivationElapsed: `T+ ${formatCountdownHms(batch.cultivationTracker.elapsedSeconds)}`,
+      operatorName: batch.operatorName.trim() || 'Operador (Tablet)',
+      triggerOd: batch.odParams.currentOd,
+      stageLabel: 'Ajuste Manual do Operador',
+      prevRpm: batch.odParams.currentRpm,
+      newRpm: batch.odParams.currentRpm,
+      prevAeration: batch.odParams.currentAeration,
+      newAeration: batch.odParams.currentAeration,
+      prevPressure: batch.odParams.currentPressure,
+      newPressure: batch.odParams.currentPressure,
+      newTemp: batch.odParams.currentTemp,
+      operatorNote: '',
+      updateCurrentPanel: true,
+    });
+    setShowManualModForm(true);
+  };
+
+  const handleSaveManualModification = (e: React.FormEvent) => {
+    e.preventDefault();
+    const prevRpm = Math.max(0, Math.min(230, Number(manualModForm.prevRpm) || 0));
+    const newRpm = Math.max(0, Math.min(230, Number(manualModForm.newRpm) || 0));
+    const prevAeration = Math.max(0, Math.min(5000, Number(manualModForm.prevAeration) || 0));
+    const newAeration = Math.max(0, Math.min(5000, Number(manualModForm.newAeration) || 0));
+    const prevPressure = Math.max(
+      0,
+      Math.min(0.85, Number(Number(manualModForm.prevPressure || 0).toFixed(3)))
+    );
+    const newPressure = Math.max(
+      0,
+      Math.min(0.85, Number(Number(manualModForm.newPressure || 0).toFixed(3)))
+    );
+    const newTemp = Math.max(0, Math.min(60, Number(manualModForm.newTemp) || 28));
+    const triggerOd = Math.max(0, Math.min(100, Number(manualModForm.triggerOd) || 37));
+
+    const dRpm = newRpm - prevRpm;
+    const dAer = newAeration - prevAeration;
+    const dPress = Number((newPressure - prevPressure).toFixed(3));
+
+    const parts: string[] = [];
+    if (dRpm !== 0) {
+      parts.push(`RPM: ${prevRpm} → ${newRpm} (${dRpm > 0 ? `+${dRpm}` : dRpm})`);
+    }
+    if (dAer !== 0) {
+      parts.push(`Ar: ${prevAeration} → ${newAeration} L/min (${dAer > 0 ? `+${dAer}` : dAer})`);
+    }
+    if (dPress !== 0) {
+      parts.push(
+        `Pressão: ${formatPressure(prevPressure)} → ${formatPressure(newPressure)} bar (${
+          dPress > 0 ? `+${formatPressure(dPress)}` : formatPressure(dPress)
+        })`
+      );
+    }
+    if (parts.length === 0) {
+      parts.push(
+        `Registro manual (${triggerOd}% O₂): ${newRpm} RPM · ${newAeration} L/min · ${formatPressure(
+          newPressure
+        )} bar · ${newTemp.toFixed(1).replace('.', ',')} °C`
+      );
+    }
+
+    const record: O2ModificationRecord = {
+      id: `mod_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: manualModForm.timestamp.trim() || formatCurrentTimeWithSeconds(),
+      cultivationElapsed:
+        manualModForm.cultivationElapsed.trim() ||
+        `T+ ${formatCountdownHms(batch.cultivationTracker.elapsedSeconds)}`,
+      operatorName: (manualModForm.operatorName.trim() || batch.operatorName.trim() || 'Operador').slice(0, 120),
+      triggerOd,
+      estimatedOdAfter: triggerOd,
+      stageLabel: (manualModForm.stageLabel.trim() || 'Ajuste Manual do Operador').slice(0, 100),
+      prevRpm,
+      newRpm,
+      deltaRpm: dRpm,
+      prevAeration,
+      newAeration,
+      deltaAeration: dAer,
+      prevPressure,
+      newPressure,
+      deltaPressure: dPress,
+      prevTemp: batch.odParams.currentTemp,
+      newTemp,
+      summary: parts.join(' · '),
+      operatorNote: manualModForm.operatorNote.trim().slice(0, 250),
+    };
+
+    commitUserBatchUpdate(
+      (prev) => ({
+        ...prev,
+        odParams: manualModForm.updateCurrentPanel
+          ? {
+              ...prev.odParams,
+              currentOd: triggerOd,
+              currentRpm: newRpm,
+              currentAeration: newAeration,
+              currentPressure: newPressure,
+              currentTemp: newTemp,
+            }
+          : prev.odParams,
+        o2Modifications: [record, ...prev.o2Modifications].slice(0, 200),
+      }),
+      { immediateCloudPush: true }
+    );
+
+    if (manualModForm.updateCurrentPanel) {
+      setManualO2Input(String(triggerOd).replace('.', ','));
+    }
+    setShowManualModForm(false);
+    setLastSavedBanner(
+      `Ajuste manual salvo às ${record.timestamp}: ${record.summary}`
     );
     window.setTimeout(() => {
       setLastSavedBanner(null);
@@ -2225,17 +2424,6 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setChartSourceFilter('ajustes')}
-                    className={`px-3 py-1 text-xs font-semibold rounded transition-colors cursor-pointer ${
-                      chartSourceFilter === 'ajustes'
-                        ? 'bg-sky-400 text-slate-950'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    A cada Ajuste ({batch.o2Modifications.length})
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => setChartSourceFilter('2h')}
                     className={`px-3 py-1 text-xs font-semibold rounded transition-colors cursor-pointer ${
                       chartSourceFilter === '2h'
@@ -2244,6 +2432,17 @@ export default function App() {
                     }`}
                   >
                     A cada 2h ({recorded2hCount}/{TWO_HOUR_SLOTS.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChartSourceFilter('ajustes')}
+                    className={`px-3 py-1 text-xs font-semibold rounded transition-colors cursor-pointer ${
+                      chartSourceFilter === 'ajustes'
+                        ? 'bg-sky-400 text-slate-950'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    A cada Ajuste ({batch.o2Modifications.length})
                   </button>
                 </div>
               </div>
@@ -2276,7 +2475,7 @@ export default function App() {
                     {batch.odParams.currentAeration} L/min
                   </span>
                   <span className="text-[10px] text-slate-500 block">
-                    Partida: 50 L/min (Livre &gt; 200)
+                    De 5 em 5 L/min (Livre &gt; 200)
                   </span>
                 </div>
 
@@ -2286,7 +2485,7 @@ export default function App() {
                     {formatPressure(batch.odParams.currentPressure)} bar
                   </span>
                   <span className="text-[10px] text-slate-500 block">
-                    Faixa: 0,600 → 0,850 bar
+                    Faixa: 0,600 → 0,810 bar
                   </span>
                 </div>
 
@@ -2300,13 +2499,132 @@ export default function App() {
               </div>
             </section>
 
-            {/* BLOCO A: GRÁFICOS A CADA AJUSTE DE O₂ */}
+            {/* BLOCO A (PRINCIPAL): GRÁFICOS A CADA 2 HORAS (0h ATÉ 60h) */}
+            {(chartSourceFilter === 'ambos' || chartSourceFilter === '2h') && (
+              <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
+                <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="w-6 h-6 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 font-mono text-xs font-bold flex items-center justify-center">
+                      A
+                    </span>
+                    <div>
+                      <h2 className="text-base font-bold text-white flex items-center gap-2">
+                        <Clock className="w-4 h-4 text-emerald-400" />
+                        <span>
+                          GRÁFICOS DO REPORTE A CADA 2 HORAS (0h ATÉ 60h · {recorded2hCount}{' '}
+                          horários registrados)
+                        </span>
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Curva periódica completa de 2 em 2 horas (incluindo os registros das 10h,
+                        12h, 14h, 16h, 18h, 20h e 22h)
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-6 space-y-5">
+                  <TelemetryLineChart
+                    title="Porcentagem de O₂ Dissolvido a cada 2 Horas (0h – 60h)"
+                    subtitle="Acompanhamento periódico de O₂ (%) registrado nas janelas de 2 em 2 horas"
+                    unit="%"
+                    yMin={0}
+                    yMax={95}
+                    strokeColor="#10b981"
+                    fillGradientId="grad_o2_2h"
+                    targetBand={{ min: 35, max: 40, label: 'META OPERACIONAL O₂ (35% – 40%)' }}
+                    height={270}
+                    data={recordedTwoHourSeries.map((item) => ({
+                      label: item.label,
+                      value: item.od,
+                      note: item.note,
+                    }))}
+                  />
+
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                    <TelemetryLineChart
+                      title="1º Agitação a cada 2 Horas (RPM)"
+                      subtitle="Curva de RPM ao longo das janelas de 2h (Partida: 95 RPM · Máx: 230 RPM)"
+                      unit="RPM"
+                      yMin={70}
+                      yMax={250}
+                      strokeColor="#38bdf8"
+                      fillGradientId="grad_rpm_2h"
+                      initialLine={{ value: 95, label: 'Partida 95 RPM' }}
+                      limitLine={{ value: 230, label: 'LIMITE MÁXIMO 230 RPM', color: '#f59e0b' }}
+                      data={recordedTwoHourSeries.map((item) => ({
+                        label: item.label,
+                        value: item.rpm,
+                        note: item.note,
+                      }))}
+                    />
+
+                    <TelemetryLineChart
+                      title="2º Vazão de Ar a cada 2 Horas (L/min)"
+                      subtitle="Curva de Vazão de Ar ao longo das janelas de 2h (Partida: 50 L/min · Liberado > 200 L/min)"
+                      unit="L/min"
+                      yMin={0}
+                      yMax={maxAerationChartY}
+                      strokeColor="#06b6d4"
+                      fillGradientId="grad_air_2h"
+                      initialLine={{ value: 50, label: 'Partida 50 L/min' }}
+                      data={recordedTwoHourSeries.map((item) => ({
+                        label: item.label,
+                        value: item.aeration,
+                        note: item.note,
+                      }))}
+                    />
+
+                    <TelemetryLineChart
+                      title="3º Pressão a cada 2 Horas (bar)"
+                      subtitle="Curva de Pressão do biorreator a cada 2h (Partida: 0,600 bar · Máx: 0,810 bar)"
+                      unit="bar"
+                      yMin={0.4}
+                      yMax={0.92}
+                      strokeColor="#a78bfa"
+                      fillGradientId="grad_pressure_2h"
+                      initialLine={{ value: 0.6, label: 'Partida 0,600 bar' }}
+                      limitLine={{
+                        value: 0.81,
+                        label: 'LIMITE MÁXIMO 0,810 bar',
+                        color: '#f59e0b',
+                      }}
+                      formatValue={(v) => formatPressure(v)}
+                      data={recordedTwoHourSeries.map((item) => ({
+                        label: item.label,
+                        value: item.pressure,
+                        note: item.note,
+                      }))}
+                    />
+
+                    <TelemetryLineChart
+                      title="Temperatura a cada 2 Horas (°C)"
+                      subtitle="Curva de Temperatura a cada 2h (Partida: 28,0 °C · Limite: 29,0 °C)"
+                      unit="°C"
+                      yMin={26}
+                      yMax={31}
+                      strokeColor="#f59e0b"
+                      fillGradientId="grad_temp_2h"
+                      targetBand={{ min: 28.0, max: 29.0, label: 'FAIXA TÉRMICA (28,0 – 29,0 °C)' }}
+                      formatValue={(v) => v.toFixed(1).replace('.', ',')}
+                      data={recordedTwoHourSeries.map((item) => ({
+                        label: item.label,
+                        value: item.temp,
+                        note: item.note,
+                      }))}
+                    />
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {/* BLOCO B: GRÁFICOS A CADA AJUSTE DE O₂ */}
             {(chartSourceFilter === 'ambos' || chartSourceFilter === 'ajustes') && (
               <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
                 <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <span className="w-6 h-6 rounded bg-sky-500/15 border border-sky-500/40 text-sky-400 font-mono text-xs font-bold flex items-center justify-center">
-                      A
+                      B
                     </span>
                     <div>
                       <h2 className="text-base font-bold text-white flex items-center gap-2">
@@ -2330,7 +2648,7 @@ export default function App() {
                     subtitle="Linha sólida: O₂ lido que motivou o ajuste · Linha tracejada verde: O₂ estimado após o ajuste"
                     unit="%"
                     yMin={0}
-                    yMax={55}
+                    yMax={95}
                     strokeColor="#38bdf8"
                     fillGradientId="grad_o2_adjustments"
                     secondaryLabel="O₂ Estimado Pós-Ajuste"
@@ -2367,7 +2685,7 @@ export default function App() {
                       title="2º Vazão de Ar a cada Ajuste (L/min)"
                       subtitle="Evolução da aeração a cada ajuste de O₂ (Início: 50 L/min · Liberado > 200 L/min)"
                       unit="L/min"
-                      yMin={30}
+                      yMin={0}
                       yMax={maxAerationChartY}
                       strokeColor="#22d3ee"
                       fillGradientId="grad_air_adjustments"
@@ -2381,16 +2699,16 @@ export default function App() {
 
                     <TelemetryLineChart
                       title="3º Pressão a cada Ajuste (bar)"
-                      subtitle="Evolução da pressão do vaso a cada ajuste de O₂ (Início: 0,600 bar · Limite: 0,850 bar)"
+                      subtitle="Evolução da pressão do vaso a cada ajuste de O₂ (Início: 0,600 bar · Limite: 0,810 bar)"
                       unit="bar"
-                      yMin={0.5}
+                      yMin={0.4}
                       yMax={0.92}
                       strokeColor="#818cf8"
                       fillGradientId="grad_pressure_adjustments"
                       initialLine={{ value: 0.6, label: 'Partida 0,600 bar' }}
                       limitLine={{
-                        value: 0.85,
-                        label: 'LIMITE MÁXIMO 0,850 bar',
+                        value: 0.81,
+                        label: 'LIMITE MÁXIMO 0,810 bar',
                         color: '#f59e0b',
                       }}
                       formatValue={(v) => formatPressure(v)}
@@ -2412,125 +2730,6 @@ export default function App() {
                       targetBand={{ min: 28.0, max: 29.0, label: 'FAIXA TÉRMICA (28,0 – 29,0 °C)' }}
                       formatValue={(v) => v.toFixed(1).replace('.', ',')}
                       data={chronologicalAdjustments.map((item) => ({
-                        label: item.label,
-                        value: item.temp,
-                        note: item.note,
-                      }))}
-                    />
-                  </div>
-                </div>
-              </section>
-            )}
-
-            {/* BLOCO B: GRÁFICOS A CADA 2 HORAS (0h ATÉ 60h) */}
-            {(chartSourceFilter === 'ambos' || chartSourceFilter === '2h') && (
-              <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
-                <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <span className="w-6 h-6 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 font-mono text-xs font-bold flex items-center justify-center">
-                      B
-                    </span>
-                    <div>
-                      <h2 className="text-base font-bold text-white flex items-center gap-2">
-                        <Clock className="w-4 h-4 text-emerald-400" />
-                        <span>
-                          GRÁFICOS DO REPORTE A CADA 2 HORAS (0h ATÉ 60h · {recorded2hCount}{' '}
-                          horários registrados)
-                        </span>
-                      </h2>
-                      <p className="text-xs text-slate-400">
-                        Curva periódica de 2 em 2 horas da porcentagem de O₂ e de todos os demais
-                        parâmetros do cultivo (até 60h)
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="p-6 space-y-5">
-                  <TelemetryLineChart
-                    title="Porcentagem de O₂ Dissolvido a cada 2 Horas (0h – 60h)"
-                    subtitle="Acompanhamento periódico de O₂ (%) registrado nas janelas de 2 em 2 horas"
-                    unit="%"
-                    yMin={0}
-                    yMax={55}
-                    strokeColor="#10b981"
-                    fillGradientId="grad_o2_2h"
-                    targetBand={{ min: 35, max: 40, label: 'META OPERACIONAL O₂ (35% – 40%)' }}
-                    height={270}
-                    data={recordedTwoHourSeries.map((item) => ({
-                      label: item.label,
-                      value: item.od,
-                      note: item.note,
-                    }))}
-                  />
-
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-                    <TelemetryLineChart
-                      title="1º Agitação a cada 2 Horas (RPM)"
-                      subtitle="Curva de RPM ao longo das janelas de 2h (Partida: 95 RPM · Máx: 230 RPM)"
-                      unit="RPM"
-                      yMin={70}
-                      yMax={250}
-                      strokeColor="#38bdf8"
-                      fillGradientId="grad_rpm_2h"
-                      initialLine={{ value: 95, label: 'Partida 95 RPM' }}
-                      limitLine={{ value: 230, label: 'LIMITE MÁXIMO 230 RPM', color: '#f59e0b' }}
-                      data={recordedTwoHourSeries.map((item) => ({
-                        label: item.label,
-                        value: item.rpm,
-                        note: item.note,
-                      }))}
-                    />
-
-                    <TelemetryLineChart
-                      title="2º Vazão de Ar a cada 2 Horas (L/min)"
-                      subtitle="Curva de Vazão de Ar ao longo das janelas de 2h (Partida: 50 L/min · Liberado > 200 L/min)"
-                      unit="L/min"
-                      yMin={30}
-                      yMax={maxAerationChartY}
-                      strokeColor="#06b6d4"
-                      fillGradientId="grad_air_2h"
-                      initialLine={{ value: 50, label: 'Partida 50 L/min' }}
-                      data={recordedTwoHourSeries.map((item) => ({
-                        label: item.label,
-                        value: item.aeration,
-                        note: item.note,
-                      }))}
-                    />
-
-                    <TelemetryLineChart
-                      title="3º Pressão a cada 2 Horas (bar)"
-                      subtitle="Curva de Pressão do biorreator a cada 2h (Partida: 0,600 bar · Máx: 0,850 bar)"
-                      unit="bar"
-                      yMin={0.5}
-                      yMax={0.92}
-                      strokeColor="#a78bfa"
-                      fillGradientId="grad_pressure_2h"
-                      initialLine={{ value: 0.6, label: 'Partida 0,600 bar' }}
-                      limitLine={{
-                        value: 0.85,
-                        label: 'LIMITE MÁXIMO 0,850 bar',
-                        color: '#f59e0b',
-                      }}
-                      formatValue={(v) => formatPressure(v)}
-                      data={recordedTwoHourSeries.map((item) => ({
-                        label: item.label,
-                        value: item.pressure,
-                        note: item.note,
-                      }))}
-                    />
-
-                    <TelemetryLineChart
-                      title="Temperatura a cada 2 Horas (°C)"
-                      subtitle="Curva de Temperatura a cada 2h (Partida: 28,0 °C · Limite: 29,0 °C)"
-                      unit="°C"
-                      yMin={26}
-                      yMax={31}
-                      strokeColor="#f59e0b"
-                      fillGradientId="grad_temp_2h"
-                      targetBand={{ min: 28.0, max: 29.0, label: 'FAIXA TÉRMICA (28,0 – 29,0 °C)' }}
-                      formatValue={(v) => v.toFixed(1).replace('.', ',')}
-                      data={recordedTwoHourSeries.map((item) => ({
                         label: item.label,
                         value: item.temp,
                         note: item.note,
@@ -2898,7 +3097,7 @@ export default function App() {
                         2º Vazão de Ar
                       </span>
                       <span className="text-[11px] font-mono text-slate-400">
-                        Partida: 50 L/min (Livre &gt; 200)
+                        De 5 em 5 L/min (Livre &gt; 200)
                       </span>
                     </div>
 
@@ -2912,7 +3111,7 @@ export default function App() {
                             true
                           )
                         }
-                        className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
+                        className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
                       >
                         -5
                       </button>
@@ -2936,22 +3135,9 @@ export default function App() {
                             true
                           )
                         }
-                        className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-white font-mono text-xs font-semibold cursor-pointer"
+                        className="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-xs font-semibold cursor-pointer"
                       >
                         +5
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          updateOdParam(
-                            'currentAeration',
-                            batch.odParams.currentAeration + 10,
-                            true
-                          )
-                        }
-                        className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-xs font-semibold cursor-pointer"
-                      >
-                        +10
                       </button>
                     </div>
 
@@ -3005,7 +3191,7 @@ export default function App() {
                         3º Pressão
                       </span>
                       <span className="text-[11px] font-mono text-slate-400">
-                        0,600 → 0,850 bar
+                        0,600 → 0,810 bar
                       </span>
                     </div>
 
@@ -3088,7 +3274,7 @@ export default function App() {
                           </button>
                         </>
                       ) : batch.odParams.currentPressure >= PROCESS_LIMITS.MAX_PRESSURE ? (
-                        <span className="text-amber-300">Limite Máx (0,850 bar)</span>
+                        <span className="text-amber-300">Limite Máx (0,810 bar)</span>
                       ) : (
                         <span className="text-emerald-400">
                           ✓ Manter ({formatPressure(batch.odParams.currentPressure)} bar)
@@ -3220,7 +3406,7 @@ export default function App() {
                           : 'bg-slate-900 text-slate-300 border border-slate-800'
                       }`}
                     >
-                      2º Subir Ar (50 → &gt;200 L/min)
+                      2º Subir Ar (de 5 em 5 L/min)
                     </span>
                     <ArrowRight className="w-3.5 h-3.5 text-slate-500" />
                     <span
@@ -3231,209 +3417,14 @@ export default function App() {
                           : 'bg-slate-900 text-slate-300 border border-slate-800'
                       }`}
                     >
-                      3º Subir Pressão (0,600 → 0,850 bar)
+                      3º Subir Pressão (0,600 → 0,810 bar)
                     </span>
                   </div>
                 </div>
               </div>
             </section>
 
-            {/* SEÇÃO 2: HISTÓRICO DE MODIFICAÇÕES REALIZADAS COM BASE NO O₂ */}
-            <section
-              id="historico-modificacoes-o2"
-              className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden"
-            >
-              <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <span className="w-6 h-6 rounded bg-sky-500/15 border border-sky-500/40 text-sky-400 font-mono text-xs font-bold flex items-center justify-center">
-                    02
-                  </span>
-                  <div>
-                    <h2 className="text-base font-bold text-white flex items-center gap-2">
-                      <span>HISTÓRICO DE MODIFICAÇÕES COM BASE NO O₂</span>
-                      <span className="text-xs font-mono px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                        {batch.o2Modifications.length} registros
-                      </span>
-                    </h2>
-                    <p className="text-xs text-slate-400">
-                      Sincronizado em tempo real para todos os dispositivos conectados ao link
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2.5 no-print">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      applyAndLogO2Modification({
-                        newRpm: batch.odParams.currentRpm,
-                        newAeration: batch.odParams.currentAeration,
-                        newPressure: batch.odParams.currentPressure,
-                        newTemp: batch.odParams.currentTemp,
-                        customStageLabel: 'Registro Manual de Estado Atual',
-                      })
-                    }
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-md transition-colors cursor-pointer"
-                  >
-                    <PlusCircle className="w-3.5 h-3.5" />
-                    Gravar Parâmetros Atuais no Histórico
-                  </button>
-
-                  {batch.o2Modifications.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={exportO2ModificationsCsv}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      Exportar Modificações (CSV)
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div className="p-6">
-                {batch.o2Modifications.length === 0 ? (
-                  <div className="bg-[#090D16] border border-slate-800/90 rounded-xl p-8 text-center space-y-2">
-                    <History className="w-7 h-7 text-slate-500 mx-auto" />
-                    <p className="text-sm font-semibold text-slate-300">
-                      Nenhuma modificação por O₂ registrada ainda nesta batelada.
-                    </p>
-                    <p className="text-xs text-slate-500 max-w-lg mx-auto">
-                      Sempre que o operador no tablet digitar o valor de O₂ e clicar em{' '}
-                      <strong className="text-slate-300">
-                        &quot;Aplicar e Salvar Modificação por O₂&quot;
-                      </strong>
-                      , o ajuste aparecerá imediatamente aqui e nos gráficos para todos que
-                      acessarem o link.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="overflow-x-auto border border-slate-800/90 rounded-xl bg-[#090D16]">
-                    <table className="w-full text-left border-collapse">
-                      <thead>
-                        <tr className="bg-[#0B101B] border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400">
-                          <th className="py-3 px-4">Horário / Cultivo</th>
-                          <th className="py-3 px-3 text-right">O₂ Lido (%)</th>
-                          <th className="py-3 px-3">Etapa Acionada</th>
-                          <th className="py-3 px-3 text-right">Agitação (RPM)</th>
-                          <th className="py-3 px-3 text-right">Vazão Ar (L/min)</th>
-                          <th className="py-3 px-3 text-right">Pressão (bar)</th>
-                          <th className="py-3 px-4">Resumo / Nota</th>
-                          <th className="py-3 px-3 text-right no-print">Ação</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/70 text-xs font-mono tabular-nums">
-                        {batch.o2Modifications.map((mod) => (
-                          <tr key={mod.id} className="hover:bg-slate-900/60 transition-colors">
-                            <td className="py-3 px-4 whitespace-nowrap">
-                              <div className="font-bold text-white">{mod.timestamp}</div>
-                              <div className="text-[11px] text-slate-400">
-                                {mod.cultivationElapsed} · {mod.operatorName}
-                              </div>
-                            </td>
-
-                            <td className="py-3 px-3 text-right">
-                              <span
-                                className={`inline-block font-bold px-2 py-0.5 rounded ${
-                                  mod.triggerOd < 37
-                                    ? 'bg-amber-950/80 text-amber-300 border border-amber-500/40'
-                                    : 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/40'
-                                }`}
-                              >
-                                {mod.triggerOd}%
-                              </span>
-                            </td>
-
-                            <td className="py-3 px-3 font-sans font-semibold text-sky-300 whitespace-nowrap">
-                              {mod.stageLabel}
-                            </td>
-
-                            <td className="py-3 px-3 text-right whitespace-nowrap">
-                              {mod.deltaRpm !== 0 ? (
-                                <div>
-                                  <span className="text-slate-400">{mod.prevRpm} → </span>
-                                  <strong className="text-white">{mod.newRpm}</strong>
-                                  <span className="ml-1 text-sky-400 font-bold">
-                                    ({mod.deltaRpm > 0 ? `+${mod.deltaRpm}` : mod.deltaRpm})
-                                  </span>
-                                </div>
-                              ) : (
-                                <span className="text-slate-500">{mod.newRpm} RPM</span>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-3 text-right whitespace-nowrap">
-                              {mod.deltaAeration !== 0 ? (
-                                <div>
-                                  <span className="text-slate-400">{mod.prevAeration} → </span>
-                                  <strong className="text-white">{mod.newAeration}</strong>
-                                  <span className="ml-1 text-sky-400 font-bold">
-                                    (
-                                    {mod.deltaAeration > 0
-                                      ? `+${mod.deltaAeration}`
-                                      : mod.deltaAeration}
-                                    )
-                                  </span>
-                                </div>
-                              ) : (
-                                <span className="text-slate-500">{mod.newAeration} L/min</span>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-3 text-right whitespace-nowrap">
-                              {mod.deltaPressure !== 0 ? (
-                                <div>
-                                  <span className="text-slate-400">
-                                    {formatPressure(mod.prevPressure)} →{' '}
-                                  </span>
-                                  <strong className="text-white">
-                                    {formatPressure(mod.newPressure)}
-                                  </strong>
-                                  <span className="ml-1 text-sky-400 font-bold">
-                                    (
-                                    {mod.deltaPressure > 0
-                                      ? `+${formatPressure(mod.deltaPressure)}`
-                                      : formatPressure(mod.deltaPressure)}
-                                    )
-                                  </span>
-                                </div>
-                              ) : (
-                                <span className="text-slate-500">
-                                  {formatPressure(mod.newPressure)} bar
-                                </span>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-4 font-sans text-slate-300">
-                              <div>{mod.summary}</div>
-                              {mod.operatorNote && (
-                                <div className="text-[11px] text-amber-300 mt-0.5">
-                                  Nota: {mod.operatorNote}
-                                </div>
-                              )}
-                            </td>
-
-                            <td className="py-3 px-3 text-right no-print">
-                              <button
-                                type="button"
-                                onClick={() => deleteModificationRecord(mod.id)}
-                                title="Remover registro"
-                                className="p-1.5 text-slate-500 hover:text-rose-400 rounded hover:bg-slate-800 transition-colors cursor-pointer"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            </section>
-
-            {/* SEÇÃO 3: REPORTE PERIÓDICO A CADA 2 HORAS (0h A 60h) */}
+            {/* SEÇÃO 2 (PRINCIPAL PARA OS OPERADORES): REPORTE PERIÓDICO A CADA 2 HORAS (0h A 60h) */}
             <section
               id="registro-2h"
               className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden"
@@ -3441,14 +3432,14 @@ export default function App() {
               <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <span className="w-6 h-6 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-400 font-mono text-xs font-bold flex items-center justify-center">
-                    03
+                    02
                   </span>
                   <div>
                     <h2 className="text-base font-bold text-white">
                       REPORTE DE PARÂMETROS A CADA 2 HORAS (0h ATÉ 60h)
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Acompanhamento periódico realizado pelos operadores ao longo do cultivo (até 60h)
+                      Checklist periódico de rotina realizado pelos operadores a cada 2 horas (até 60h)
                     </p>
                   </div>
                 </div>
@@ -3607,7 +3598,21 @@ export default function App() {
                                       </button>
                                     )}
                                   </div>
-                                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                                  <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
+                                    <div>
+                                      <label className="block text-xs text-slate-400 mb-1">
+                                        Horário (HH:MM)
+                                      </label>
+                                      <input
+                                        type="text"
+                                        placeholder="Ex: 14:00"
+                                        value={rec?.recordedAt ?? ''}
+                                        onChange={(e) =>
+                                          updateTwoHourSlotField(hr, 'recordedAt', e.target.value)
+                                        }
+                                        className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#090D16] border border-slate-700 rounded text-white"
+                                      />
+                                    </div>
                                     <div>
                                       <label className="block text-xs text-slate-400 mb-1">
                                         O₂ / OD (%)
@@ -3664,7 +3669,7 @@ export default function App() {
                                     </div>
                                     <div>
                                       <label className="block text-xs text-slate-400 mb-1">
-                                        Pressão (0,6 → 0,850)
+                                        Pressão (0,6 → 0,810)
                                       </label>
                                       <input
                                         type="number"
@@ -3741,6 +3746,494 @@ export default function App() {
                     className="w-full text-sm text-white placeholder:text-slate-600 bg-[#090D16] border border-slate-800 rounded-lg p-3 focus:outline-none focus:border-sky-400 resize-y"
                   />
                 </div>
+              </div>
+            </section>
+
+            {/* SEÇÃO 3 (ABAIXO DO REPORTE DE 2H): HISTÓRICO DE MODIFICAÇÕES REALIZADAS COM BASE NO O₂ */}
+            <section
+              id="historico-modificacoes-o2"
+              className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden"
+            >
+              <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <span className="w-6 h-6 rounded bg-sky-500/15 border border-sky-500/40 text-sky-400 font-mono text-xs font-bold flex items-center justify-center">
+                    03
+                  </span>
+                  <div>
+                    <h2 className="text-base font-bold text-white flex items-center gap-2">
+                      <span>HISTÓRICO DE MODIFICAÇÕES COM BASE NO O₂</span>
+                      <span className="text-xs font-mono px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                        {batch.o2Modifications.length} registros
+                      </span>
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Sincronizado em tempo real para todos os dispositivos conectados ao link
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5 no-print">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      showManualModForm ? setShowManualModForm(false) : openManualModificationForm()
+                    }
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors cursor-pointer"
+                  >
+                    <PlusCircle className="w-3.5 h-3.5" />
+                    {showManualModForm ? 'Fechar Formulário Manual' : 'Adicionar Ajuste Manual'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      applyAndLogO2Modification({
+                        newRpm: batch.odParams.currentRpm,
+                        newAeration: batch.odParams.currentAeration,
+                        newPressure: batch.odParams.currentPressure,
+                        newTemp: batch.odParams.currentTemp,
+                        customStageLabel: 'Registro Manual de Estado Atual',
+                      })
+                    }
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-950 bg-sky-400 hover:bg-sky-300 rounded-md transition-colors cursor-pointer"
+                  >
+                    <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                    Gravar Parâmetros Atuais
+                  </button>
+
+                  {batch.o2Modifications.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={exportO2ModificationsCsv}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Exportar Modificações (CSV)
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="p-6 space-y-5">
+                {/* Formulário de Adição de Ajuste Manual */}
+                {showManualModForm && (
+                  <form
+                    onSubmit={handleSaveManualModification}
+                    className="bg-[#090D16] border border-emerald-500/50 rounded-xl p-5 space-y-4 no-print"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-emerald-300 flex items-center gap-2">
+                          <PlusCircle className="w-4 h-4" />
+                          <span>Adicionar Ajuste Manual ao Histórico de Modificações</span>
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Preencha os parâmetros do ajuste manual para registrá-lo na tabela e nos
+                          gráficos
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Horário (HH:MM:SS)
+                        </label>
+                        <input
+                          type="text"
+                          value={manualModForm.timestamp}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({ ...prev, timestamp: e.target.value }))
+                          }
+                          placeholder="Ex: 14:30:00"
+                          className="w-full px-3 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Tempo de Cultivo
+                        </label>
+                        <input
+                          type="text"
+                          value={manualModForm.cultivationElapsed}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              cultivationElapsed: e.target.value,
+                            }))
+                          }
+                          placeholder="Ex: T+ 26:00:00"
+                          className="w-full px-3 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">Operador</label>
+                        <input
+                          type="text"
+                          value={manualModForm.operatorName}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({ ...prev, operatorName: e.target.value }))
+                          }
+                          placeholder="Nome do operador"
+                          className="w-full px-3 py-1.5 text-sm bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">O₂ Lido (%)</label>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={manualModForm.triggerOd}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              triggerOd: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-3 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-7 gap-3">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">RPM Antes</label>
+                        <input
+                          type="number"
+                          step={5}
+                          value={manualModForm.prevRpm}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              prevRpm: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-slate-300"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-sky-300 font-semibold mb-1">
+                          RPM Depois
+                        </label>
+                        <input
+                          type="number"
+                          step={5}
+                          value={manualModForm.newRpm}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              newRpm: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-sky-500/60 rounded-lg text-white font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Ar Antes (L/min)
+                        </label>
+                        <input
+                          type="number"
+                          step={5}
+                          value={manualModForm.prevAeration}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              prevAeration: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-slate-300"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-sky-300 font-semibold mb-1">
+                          Ar Depois (L/min)
+                        </label>
+                        <input
+                          type="number"
+                          step={5}
+                          value={manualModForm.newAeration}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              newAeration: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-sky-500/60 rounded-lg text-white font-bold"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Pressão Antes (bar)
+                        </label>
+                        <input
+                          type="number"
+                          step={0.005}
+                          value={manualModForm.prevPressure}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              prevPressure: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-slate-300"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-sky-300 font-semibold mb-1">
+                          Pressão Depois (bar)
+                        </label>
+                        <input
+                          type="number"
+                          step={0.005}
+                          value={manualModForm.newPressure}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              newPressure: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-sky-500/60 rounded-lg text-white font-bold"
+                        />
+                      </div>
+
+                      <div className="col-span-2 sm:col-span-1">
+                        <label className="block text-xs text-slate-400 mb-1">Temp (°C)</label>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={manualModForm.newTemp}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              newTemp: parseFloat(e.target.value) || 0,
+                            }))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Etapa / Identificação do Ajuste
+                        </label>
+                        <input
+                          type="text"
+                          value={manualModForm.stageLabel}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({ ...prev, stageLabel: e.target.value }))
+                          }
+                          placeholder="Ex: Ajuste Manual do Operador"
+                          className="w-full px-3 py-1.5 text-xs bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs text-slate-400 mb-1">
+                          Observação / Motivo (Opcional)
+                        </label>
+                        <input
+                          type="text"
+                          value={manualModForm.operatorNote}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({ ...prev, operatorNote: e.target.value }))
+                          }
+                          placeholder="Ex: Ajuste manual realizado no reator..."
+                          className="w-full px-3 py-1.5 text-xs bg-[#111827] border border-slate-700 rounded-lg text-white"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800">
+                      <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={manualModForm.updateCurrentPanel}
+                          onChange={(e) =>
+                            setManualModForm((prev) => ({
+                              ...prev,
+                              updateCurrentPanel: e.target.checked,
+                            }))
+                          }
+                          className="rounded border-slate-700 bg-slate-900 text-sky-400"
+                        />
+                        <span>
+                          Atualizar também os parâmetros atuais do painel com os valores
+                          &quot;Depois&quot;
+                        </span>
+                      </label>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowManualModForm(false)}
+                          className="px-3.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
+                        >
+                          Cancelar
+                        </button>
+                        <button
+                          type="submit"
+                          className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg transition-colors cursor-pointer"
+                        >
+                          <Check className="w-3.5 h-3.5 stroke-[3]" />
+                          Salvar Ajuste Manual
+                        </button>
+                      </div>
+                    </div>
+                  </form>
+                )}
+
+                {batch.o2Modifications.length === 0 ? (
+                  <div className="bg-[#090D16] border border-slate-800/90 rounded-xl p-8 text-center space-y-2">
+                    <History className="w-7 h-7 text-slate-500 mx-auto" />
+                    <p className="text-sm font-semibold text-slate-300">
+                      Nenhuma modificação por O₂ registrada ainda nesta batelada.
+                    </p>
+                    <p className="text-xs text-slate-500 max-w-lg mx-auto">
+                      Sempre que o operador no tablet clicar em{' '}
+                      <strong className="text-slate-300">
+                        &quot;Aplicar e Salvar Modificação por O₂&quot;
+                      </strong>{' '}
+                      ou em{' '}
+                      <strong className="text-slate-300">
+                        &quot;Adicionar Ajuste Manual&quot;
+                      </strong>
+                      , o ajuste aparecerá imediatamente aqui e nos gráficos para todos que
+                      acessarem o link.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-slate-800/90 rounded-xl bg-[#090D16]">
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-[#0B101B] border-b border-slate-800 text-[11px] font-mono uppercase text-slate-400">
+                          <th className="py-3 px-4">Horário / Cultivo</th>
+                          <th className="py-3 px-3 text-right">O₂ Lido (%)</th>
+                          <th className="py-3 px-3">Etapa Acionada</th>
+                          <th className="py-3 px-3 text-right">Agitação (RPM)</th>
+                          <th className="py-3 px-3 text-right">Vazão Ar (L/min)</th>
+                          <th className="py-3 px-3 text-right">Pressão (bar)</th>
+                          <th className="py-3 px-4">Resumo / Nota</th>
+                          <th className="py-3 px-3 text-right no-print">Ação</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 text-xs font-mono tabular-nums">
+                        {batch.o2Modifications.map((mod) => (
+                          <tr key={mod.id} className="hover:bg-slate-900/60 transition-colors">
+                            <td className="py-3 px-4 whitespace-nowrap">
+                              <div className="font-bold text-white">{mod.timestamp}</div>
+                              <div className="text-[11px] text-slate-400">
+                                {mod.cultivationElapsed} · {mod.operatorName}
+                              </div>
+                            </td>
+
+                            <td className="py-3 px-3 text-right">
+                              <span
+                                className={`inline-block font-bold px-2 py-0.5 rounded ${
+                                  mod.triggerOd < 37
+                                    ? 'bg-amber-950/80 text-amber-300 border border-amber-500/40'
+                                    : 'bg-emerald-950/80 text-emerald-300 border border-emerald-500/40'
+                                }`}
+                              >
+                                {mod.triggerOd}%
+                              </span>
+                            </td>
+
+                            <td className="py-3 px-3 font-sans font-semibold text-sky-300 whitespace-nowrap">
+                              {mod.stageLabel}
+                            </td>
+
+                            <td className="py-3 px-3 text-right whitespace-nowrap">
+                              {mod.deltaRpm !== 0 ? (
+                                <div>
+                                  <span className="text-slate-400">{mod.prevRpm} → </span>
+                                  <strong className="text-white">{mod.newRpm}</strong>
+                                  <span className="ml-1 text-sky-400 font-bold">
+                                    ({mod.deltaRpm > 0 ? `+${mod.deltaRpm}` : mod.deltaRpm})
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-slate-500">{mod.newRpm} RPM</span>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-3 text-right whitespace-nowrap">
+                              {mod.deltaAeration !== 0 ? (
+                                <div>
+                                  <span className="text-slate-400">{mod.prevAeration} → </span>
+                                  <strong className="text-white">{mod.newAeration}</strong>
+                                  <span className="ml-1 text-sky-400 font-bold">
+                                    (
+                                    {mod.deltaAeration > 0
+                                      ? `+${mod.deltaAeration}`
+                                      : mod.deltaAeration}
+                                    )
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-slate-500">{mod.newAeration} L/min</span>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-3 text-right whitespace-nowrap">
+                              {mod.deltaPressure !== 0 ? (
+                                <div>
+                                  <span className="text-slate-400">
+                                    {formatPressure(mod.prevPressure)} →{' '}
+                                  </span>
+                                  <strong className="text-white">
+                                    {formatPressure(mod.newPressure)}
+                                  </strong>
+                                  <span className="ml-1 text-sky-400 font-bold">
+                                    (
+                                    {mod.deltaPressure > 0
+                                      ? `+${formatPressure(mod.deltaPressure)}`
+                                      : formatPressure(mod.deltaPressure)}
+                                    )
+                                  </span>
+                                </div>
+                              ) : (
+                                <span className="text-slate-500">
+                                  {formatPressure(mod.newPressure)} bar
+                                </span>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-4 font-sans text-slate-300">
+                              <div>{mod.summary}</div>
+                              {mod.operatorNote && (
+                                <div className="text-[11px] text-amber-300 mt-0.5">
+                                  Nota: {mod.operatorNote}
+                                </div>
+                              )}
+                            </td>
+
+                            <td className="py-3 px-3 text-right no-print">
+                              <button
+                                type="button"
+                                onClick={() => deleteModificationRecord(mod.id)}
+                                title="Remover registro"
+                                className="p-1.5 text-slate-500 hover:text-rose-400 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </section>
           </>
