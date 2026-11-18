@@ -40,7 +40,7 @@
         },
         "twoHourLogs": {
           "type": "object",
-          "description": "Registros periódicos de parâmetros a cada 2 horas (0h a 24h)."
+          "description": "Registros periódicos de parâmetros a cada 2 horas (0h a 60h)."
         },
         "o2Modifications": {
           "type": "array",

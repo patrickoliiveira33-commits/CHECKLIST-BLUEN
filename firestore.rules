@@ -26,7 +26,7 @@ service cloud.firestore {
         && od.currentOd is number && od.currentOd >= 0 && od.currentOd <= 100
         && od.referenceOd is number && od.referenceOd >= 0 && od.referenceOd <= 100
         && od.currentRpm is number && od.currentRpm >= 0 && od.currentRpm <= 230
-        && od.currentAeration is number && od.currentAeration >= 0 && od.currentAeration <= 200
+        && od.currentAeration is number && od.currentAeration >= 0 && od.currentAeration <= 5000
         && od.currentPressure is number && od.currentPressure >= 0 && od.currentPressure <= 0.85
         && od.currentTemp is number && od.currentTemp >= 0 && od.currentTemp <= 60;
     }
@@ -78,7 +78,7 @@ service cloud.firestore {
         && data.generalNotes is string && data.generalNotes.size() <= 3000
         && isValidOdParams(data.odParams)
         && isValidCultivationTracker(data.cultivationTracker)
-        && data.twoHourLogs is map && data.twoHourLogs.size() <= 20
+        && data.twoHourLogs is map && data.twoHourLogs.size() <= 100
         && data.o2Modifications is list && data.o2Modifications.size() <= 200
         && (data.o2Modifications.size() == 0 || data.o2Modifications[0] is map)
         && data.updatedAtClient is string && data.updatedAtClient.size() <= 60

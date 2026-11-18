@@ -108,12 +108,13 @@ interface BatchState {
   updatedAtMs?: number;
 }
 
-// Parâmetros Iniciais e Limites Máximos Oficiais do Processo BlueN
+// Parâmetros Iniciais e Limites Oficiais do Processo BlueN
 const PROCESS_LIMITS = {
   INITIAL_RPM: 95,
   MAX_RPM: 230,
   INITIAL_AERATION: 50,
-  MAX_AERATION: 200,
+  AERATION_CASCADE_REF: 200,
+  MAX_AERATION: 5000, // Liberado para passar de 200 L/min livremente
   INITIAL_PRESSURE: 0.6,
   MAX_PRESSURE: 0.85,
   INITIAL_TEMP: 28.0,
@@ -125,7 +126,8 @@ const PROCESS_LIMITS = {
 };
 
 const TWO_HOURS_SECONDS = 2 * 60 * 60;
-const TWO_HOUR_SLOTS = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
+// Janelas de 2 em 2 horas até 60h de cultivo (0h, 2h, 4h ... 60h)
+const TWO_HOUR_SLOTS = Array.from({ length: 31 }, (_, i) => i * 2);
 
 const PRIMARY_STORAGE_KEY = 'bluen_persistent_batch_state_v1';
 const LEGACY_STORAGE_KEYS = [
@@ -292,42 +294,26 @@ function hydrateParsedBatchState(parsed: Record<string, any>): BatchState {
   const hydratedTwoHourLogs: Record<number, TwoHourRecord> = {};
 
   TWO_HOUR_SLOTS.forEach((hr) => {
-    const item = rawLogs[hr] ?? rawLogs[String(hr)] ?? defaultLogs[hr];
-    hydratedTwoHourLogs[hr] = {
-      hourMark: hr,
-      recorded: Boolean(item?.recorded),
-      recordedAt: item?.recordedAt ? String(item.recordedAt) : '',
-      od: Number(item?.od ?? 37.0),
-      rpm: Number(item?.rpm ?? PROCESS_LIMITS.INITIAL_RPM),
-      aeration: Number(item?.aeration ?? PROCESS_LIMITS.INITIAL_AERATION),
-      pressure: Number(item?.pressure ?? PROCESS_LIMITS.INITIAL_PRESSURE),
-      temp: Number(item?.temp ?? PROCESS_LIMITS.INITIAL_TEMP),
-      note: item?.note ? String(item.note) : '',
-    };
+    const item = rawLogs[hr] ?? rawLogs[String(hr)];
+    if (item && typeof item === 'object') {
+      hydratedTwoHourLogs[hr] = {
+        hourMark: hr,
+        recorded: Boolean(item.recorded),
+        recordedAt: item.recordedAt ? String(item.recordedAt) : '',
+        od: Number(item.od ?? 37.0),
+        rpm: Number(item.rpm ?? PROCESS_LIMITS.INITIAL_RPM),
+        aeration: Number(item.aeration ?? PROCESS_LIMITS.INITIAL_AERATION),
+        pressure: Number(item.pressure ?? PROCESS_LIMITS.INITIAL_PRESSURE),
+        temp: Number(item.temp ?? PROCESS_LIMITS.INITIAL_TEMP),
+        note: item.note ? String(item.note) : '',
+      };
+    } else {
+      hydratedTwoHourLogs[hr] = {
+        ...defaultLogs[hr],
+        recorded: hr === 0 ? Boolean(defaultLogs[0]?.recorded) : false,
+      };
+    }
   });
-
-  if (savedCultivation.isRunning && (savedCultivation.autoLogEvery2h ?? true)) {
-    TWO_HOUR_SLOTS.forEach((slotHour) => {
-      const slotSeconds = slotHour * 3600;
-      if (
-        slotHour > 0 &&
-        computedElapsed >= slotSeconds &&
-        !hydratedTwoHourLogs[slotHour]?.recorded
-      ) {
-        hydratedTwoHourLogs[slotHour] = {
-          hourMark: slotHour,
-          recorded: true,
-          recordedAt: formatCurrentTime(),
-          od: hydratedOdParams.currentOd,
-          rpm: hydratedOdParams.currentRpm,
-          aeration: hydratedOdParams.currentAeration,
-          pressure: hydratedOdParams.currentPressure,
-          temp: hydratedOdParams.currentTemp,
-          note: 'Registro automático de 2h',
-        };
-      }
-    });
-  }
 
   return {
     operatorName: String(parsed.operatorName ?? '').slice(0, 120),
@@ -408,7 +394,7 @@ function buildFirestorePayload(state: BatchState) {
       currentOd: Math.max(0, Math.min(100, Number(state.odParams.currentOd ?? 36))),
       referenceOd: Math.max(0, Math.min(100, Number(state.odParams.referenceOd ?? 37))),
       currentRpm: Math.max(0, Math.min(230, Number(state.odParams.currentRpm ?? 95))),
-      currentAeration: Math.max(0, Math.min(200, Number(state.odParams.currentAeration ?? 50))),
+      currentAeration: Math.max(0, Math.min(5000, Number(state.odParams.currentAeration ?? 50))),
       currentPressure: Math.max(0, Math.min(0.85, Number(state.odParams.currentPressure ?? 0.6))),
       currentTemp: Math.max(0, Math.min(60, Number(state.odParams.currentTemp ?? 28))),
     },
@@ -785,90 +771,112 @@ function TelemetryLineChart({
             />
           )}
 
-          {pointsCoords.map((pt, idx) => {
-            const isHovered = hoveredIdx === idx;
-            return (
-              <g
-                key={idx}
-                onMouseEnter={() => setHoveredIdx(idx)}
-                onMouseLeave={() => setHoveredIdx(null)}
-                className="cursor-pointer"
-              >
-                {isHovered && (
-                  <line
-                    x1={pt.x}
-                    y1={padTop}
-                    x2={pt.x}
-                    y2={padTop + plotHeight}
-                    stroke="#38bdf8"
-                    strokeWidth="1"
-                    strokeDasharray="2 2"
-                  />
-                )}
+          { (() => {
+            let lastRenderedXLabelPos = -999;
+            let lastRenderedTopValuePos = -999;
+            const minXLabelGap = 48;
+            const minTopValueGap = 36;
 
-                {pt.secY !== undefined && (
+            return pointsCoords.map((pt, idx) => {
+              const isHovered = hoveredIdx === idx;
+              const isLast = idx === pointsCoords.length - 1;
+              const canShowXLabel =
+                isHovered ||
+                idx === 0 ||
+                (isLast && pt.x - lastRenderedXLabelPos >= 34) ||
+                pt.x - lastRenderedXLabelPos >= minXLabelGap;
+
+              if (canShowXLabel && !isHovered) {
+                lastRenderedXLabelPos = pt.x;
+              }
+
+              const canShowTopValue =
+                isHovered ||
+                idx === 0 ||
+                isLast ||
+                pt.x - lastRenderedTopValuePos >= minTopValueGap;
+
+              if (canShowTopValue && !isHovered) {
+                lastRenderedTopValuePos = pt.x;
+              }
+
+              return (
+                <g
+                  key={idx}
+                  onMouseEnter={() => setHoveredIdx(idx)}
+                  onMouseLeave={() => setHoveredIdx(null)}
+                  className="cursor-pointer"
+                >
+                  {isHovered && (
+                    <line
+                      x1={pt.x}
+                      y1={padTop}
+                      x2={pt.x}
+                      y2={padTop + plotHeight}
+                      stroke="#38bdf8"
+                      strokeWidth="1"
+                      strokeDasharray="2 2"
+                    />
+                  )}
+
+                  {pt.secY !== undefined && (
+                    <circle
+                      cx={pt.x}
+                      cy={pt.secY}
+                      r={isHovered ? 5 : 3.5}
+                      fill="#090D16"
+                      stroke={secondaryColor}
+                      strokeWidth="2"
+                    />
+                  )}
+
                   <circle
                     cx={pt.x}
-                    cy={pt.secY}
-                    r={isHovered ? 5 : 3.5}
+                    cy={pt.y}
+                    r={isHovered ? 6 : 4.5}
                     fill="#090D16"
-                    stroke={secondaryColor}
-                    strokeWidth="2"
+                    stroke={strokeColor}
+                    strokeWidth={isHovered ? 3 : 2.2}
                   />
-                )}
 
-                <circle
-                  cx={pt.x}
-                  cy={pt.y}
-                  r={isHovered ? 6 : 4.5}
-                  fill="#090D16"
-                  stroke={strokeColor}
-                  strokeWidth={isHovered ? 3 : 2.2}
-                />
+                  {canShowTopValue && (
+                    <text
+                      x={pt.x}
+                      y={pt.y - 10}
+                      textAnchor="middle"
+                      className={`font-mono text-[10px] font-bold ${
+                        isHovered ? 'fill-white' : 'fill-slate-200'
+                      }`}
+                    >
+                      {formatValue(pt.raw.value)}
+                    </text>
+                  )}
 
-                <text
-                  x={pt.x}
-                  y={pt.y - 10}
-                  textAnchor="middle"
-                  className={`font-mono text-[10px] font-bold ${
-                    isHovered ? 'fill-white' : 'fill-slate-200'
-                  }`}
-                >
-                  {formatValue(pt.raw.value)}
-                </text>
+                  {/* Exibe APENAS o horário em linha única sem legenda do ponto e sem sobreposição */}
+                  {canShowXLabel && (
+                    <text
+                      x={pt.x}
+                      y={padTop + plotHeight + 20}
+                      textAnchor="middle"
+                      className={`font-mono text-[10px] ${
+                        isHovered ? 'fill-sky-400 font-bold' : 'fill-slate-400'
+                      }`}
+                    >
+                      {pt.raw.label}
+                    </text>
+                  )}
 
-                <text
-                  x={pt.x}
-                  y={padTop + plotHeight + 16}
-                  textAnchor="middle"
-                  className={`font-mono text-[10px] ${
-                    isHovered ? 'fill-sky-400 font-bold' : 'fill-slate-400'
-                  }`}
-                >
-                  {pt.raw.label}
-                </text>
-
-                {pt.raw.sublabel && (
-                  <text
-                    x={pt.x}
-                    y={padTop + plotHeight + 29}
-                    textAnchor="middle"
-                    className="fill-slate-500 font-mono text-[9px]"
-                  >
-                    {pt.raw.sublabel}
-                  </text>
-                )}
-
-                <rect
-                  x={pt.x - 18}
-                  y={padTop}
-                  width={36}
-                  height={plotHeight + padBottom}
-                  fill="transparent"
-                />
-              </g>
-            );
-          })}
+                  <rect
+                    x={pt.x - 18}
+                    y={padTop}
+                    width={36}
+                    height={plotHeight + padBottom}
+                    fill="transparent"
+                  />
+                </g>
+              );
+            });
+          })() }
         </svg>
       </div>
 
@@ -1444,7 +1452,7 @@ export default function App() {
     const reachesRpmMax = recommendedRpm >= MAX_RPM;
     const stillNeedsAfterRpm = reachesRpmMax && remainingDeficit > 0.2;
 
-    // 2º PASSO: Vazão de Ar (50 -> 200 L/min)
+    // 2º PASSO: Vazão de Ar (Partida 50 L/min — Liberado para passar de 200 L/min)
     let deltaAeration = 0;
     let recommendedAeration = currentAeration;
     let odCoveredByAeration = 0;
@@ -1461,19 +1469,18 @@ export default function App() {
       deltaAeration = Math.min(availableAerationHeadroom, steppedNeededAeration);
       recommendedAeration = currentAeration + deltaAeration;
       odCoveredByAeration = deltaAeration * odGainPerAeration;
-      remainingDeficit = Math.max(0, remainingDeficit - odCoveredByAeration);
     }
 
-    // 3º PASSO: Pressão (0,600 -> 0,850 bar)
+    // 3º PASSO: Pressão (0,600 -> 0,850 bar) quando Vazão de Ar já atingiu >= 200 L/min
     let deltaPressure = 0;
     let recommendedPressure = currentPressure;
     let odCoveredByPressure = 0;
-    const stillNeedsAfterAeration =
+    const reachedAerationCascadeRef =
       (stillNeedsAfterRpm || currentRpm >= MAX_RPM) &&
-      (recommendedAeration >= MAX_AERATION || currentAeration >= MAX_AERATION) &&
-      remainingDeficit > 0.2;
+      currentAeration >= PROCESS_LIMITS.AERATION_CASCADE_REF &&
+      currentPressure < MAX_PRESSURE;
 
-    if (stillNeedsAfterAeration) {
+    if (reachedAerationCascadeRef) {
       const availablePressureHeadroom = Math.max(0, MAX_PRESSURE - currentPressure);
       const rawSteps = Math.max(1, Math.ceil(remainingDeficit / (0.025 * odGainPerPressure)));
       let steppedNeededPressure = Number((rawSteps * 0.025).toFixed(3));
@@ -1485,7 +1492,6 @@ export default function App() {
       );
       recommendedPressure = Number((currentPressure + deltaPressure).toFixed(3));
       odCoveredByPressure = deltaPressure * odGainPerPressure;
-      remainingDeficit = Math.max(0, remainingDeficit - odCoveredByPressure);
     }
 
     const estimatedFinalOd = Number(
@@ -1517,14 +1523,14 @@ export default function App() {
           : `${modePrefix} (2º PASSO · RPM MÁX): SUBIR VAZÃO DE AR EM +${deltaAeration} L/min (IR PARA ${recommendedAeration} L/min)`;
     }
 
-    if (deltaPressure > 0 || (stillNeedsAfterAeration && currentAeration >= MAX_AERATION)) {
+    if (deltaPressure > 0 && currentAeration >= PROCESS_LIMITS.AERATION_CASCADE_REF) {
       activeStage = 'pressure';
       stageLabel = isPreventiveFineAdjustment
-        ? 'Ajuste Leve · 3º Pressão (bar)'
-        : '3º Cascata · Pressão (bar)';
-      operatorActionHeadline = `${modePrefix} (3º PASSO): SUBIR PRESSÃO EM +${formatPressure(
+        ? 'Ajuste Leve · Vazão de Ar (>200) ou 3º Pressão'
+        : '2º Vazão de Ar (>200 L/min) ou 3º Pressão (bar)';
+      operatorActionHeadline = `${modePrefix}: SUBIR VAZÃO DE AR (+${deltaAeration} L/min → ${recommendedAeration} L/min) OU 3º PASSO PRESSÃO (+${formatPressure(
         deltaPressure
-      )} bar (IR PARA ${formatPressure(recommendedPressure)} bar)`;
+      )} bar → ${formatPressure(recommendedPressure)} bar)`;
     }
 
     return {
@@ -1534,7 +1540,7 @@ export default function App() {
       activeStage,
       stageLabel,
       atRpmMax: recommendedRpm >= MAX_RPM,
-      atAerationMax: recommendedAeration >= MAX_AERATION,
+      atAerationMax: false,
       atPressureMax: recommendedPressure >= MAX_PRESSURE,
       deltaRpm,
       recommendedRpm,
@@ -1824,13 +1830,17 @@ export default function App() {
   const recorded2hCount = TWO_HOUR_SLOTS.filter((hr) => batch.twoHourLogs[hr]?.recorded).length;
 
   // ==========================================================================
-  // SÉRIES DE DADOS PARA OS GRÁFICOS (A CADA AJUSTE DE O2 E A CADA 2 HORAS)
+  // SÉRIES DE DADOS PARA OS GRÁFICOS (APENAS O HORÁRIO NO EIXO X, SEM LEGENDA DO PONTO)
   // ==========================================================================
   const chronologicalAdjustments = useMemo(() => {
     const reversed = [...batch.o2Modifications].reverse();
+    const initialClock =
+      batch.twoHourLogs[0]?.recordedAt ||
+      (batch.startedAt.includes(' ') ? batch.startedAt.split(' ').pop()?.slice(0, 5) : '') ||
+      '00:00';
+
     const initialPoint = {
-      label: 'Partida',
-      sublabel: '0h',
+      label: initialClock || '00:00',
       odTrigger: 37.0,
       odAfter: 37.0,
       rpm: PROCESS_LIMITS.INITIAL_RPM,
@@ -1841,23 +1851,21 @@ export default function App() {
     };
 
     const mapped = reversed.map((mod, idx) => ({
-      label: `Aj. #${idx + 1}`,
-      sublabel: mod.timestamp.slice(0, 5),
+      label: mod.timestamp ? mod.timestamp.slice(0, 5) : `${idx + 1}`,
       odTrigger: mod.triggerOd,
       odAfter: mod.estimatedOdAfter,
       rpm: mod.newRpm,
       aeration: mod.newAeration,
       pressure: mod.newPressure,
       temp: mod.newTemp,
-      note: `${mod.timestamp} (${mod.cultivationElapsed}) — ${mod.summary}`,
+      note: `Ajuste #${idx + 1} às ${mod.timestamp} (${mod.cultivationElapsed}) — ${mod.summary}`,
     }));
 
     if (mapped.length === 0) {
       return [
         initialPoint,
         {
-          label: 'Atual',
-          sublabel: 'Agora',
+          label: formatCurrentTime(),
           odTrigger: batch.odParams.currentOd,
           odAfter: cascadeCalculation.estimatedFinalOd,
           rpm: batch.odParams.currentRpm,
@@ -1870,21 +1878,26 @@ export default function App() {
     }
 
     return [initialPoint, ...mapped];
-  }, [batch.o2Modifications, batch.odParams, cascadeCalculation.estimatedFinalOd]);
+  }, [
+    batch.o2Modifications,
+    batch.odParams,
+    batch.twoHourLogs,
+    batch.startedAt,
+    cascadeCalculation.estimatedFinalOd,
+  ]);
 
   const recordedTwoHourSeries = useMemo(() => {
     const recordedSlots = TWO_HOUR_SLOTS.filter((hr) => batch.twoHourLogs[hr]?.recorded).map(
       (hr) => {
         const rec = batch.twoHourLogs[hr];
         return {
-          label: `${hr}h`,
-          sublabel: rec.recordedAt || '',
+          label: rec.recordedAt ? rec.recordedAt.slice(0, 5) : `${hr}h`,
           od: rec.od,
           rpm: rec.rpm,
           aeration: rec.aeration,
           pressure: rec.pressure,
           temp: rec.temp,
-          note: rec.note || `Reporte de ${hr}h de cultivo`,
+          note: `${hr}h (${rec.recordedAt || '-'}) — ${rec.note || `Reporte de ${hr}h de cultivo`}`,
         };
       }
     );
@@ -1893,8 +1906,7 @@ export default function App() {
       return [
         ...recordedSlots,
         {
-          label: 'Atual',
-          sublabel: formatCurrentTime(),
+          label: formatCurrentTime(),
           od: batch.odParams.currentOd,
           rpm: batch.odParams.currentRpm,
           aeration: batch.odParams.currentAeration,
@@ -1907,6 +1919,17 @@ export default function App() {
 
     return recordedSlots;
   }, [batch.twoHourLogs, batch.odParams]);
+
+  const maxAerationChartY = useMemo(() => {
+    const allAerValues = [
+      220,
+      batch.odParams.currentAeration,
+      ...chronologicalAdjustments.map((item) => item.aeration),
+      ...recordedTwoHourSeries.map((item) => item.aeration),
+    ];
+    const highest = Math.max(...allAerValues);
+    return Math.ceil((highest + 25) / 50) * 50;
+  }, [batch.odParams.currentAeration, chronologicalAdjustments, recordedTwoHourSeries]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#090D16] text-slate-100 selection:bg-sky-500/30">
@@ -2252,7 +2275,9 @@ export default function App() {
                   <span className="text-xl font-bold text-cyan-400">
                     {batch.odParams.currentAeration} L/min
                   </span>
-                  <span className="text-[10px] text-slate-500 block">Faixa: 50 → 200 L/min</span>
+                  <span className="text-[10px] text-slate-500 block">
+                    Partida: 50 L/min (Livre &gt; 200)
+                  </span>
                 </div>
 
                 <div className="bg-[#090D16] border border-slate-800 rounded-lg p-3">
@@ -2292,8 +2317,8 @@ export default function App() {
                         </span>
                       </h2>
                       <p className="text-xs text-slate-400">
-                        Evolução da porcentagem de O₂ e de todos os parâmetros do biorreator a cada
-                        intervenção registrada no histórico
+                        Evolução da porcentagem de O₂ e de todos os parâmetros do biorreator por
+                        horário de intervenção
                       </p>
                     </div>
                   </div>
@@ -2314,7 +2339,6 @@ export default function App() {
                     height={270}
                     data={chronologicalAdjustments.map((item) => ({
                       label: item.label,
-                      sublabel: item.sublabel,
                       value: item.odTrigger,
                       secondaryValue: item.odAfter,
                       note: item.note,
@@ -2334,7 +2358,6 @@ export default function App() {
                       limitLine={{ value: 230, label: 'LIMITE MÁXIMO 230 RPM', color: '#f59e0b' }}
                       data={chronologicalAdjustments.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.rpm,
                         note: item.note,
                       }))}
@@ -2342,17 +2365,15 @@ export default function App() {
 
                     <TelemetryLineChart
                       title="2º Vazão de Ar a cada Ajuste (L/min)"
-                      subtitle="Evolução da aeração a cada ajuste de O₂ (Início: 50 L/min · Limite: 200 L/min)"
+                      subtitle="Evolução da aeração a cada ajuste de O₂ (Início: 50 L/min · Liberado > 200 L/min)"
                       unit="L/min"
                       yMin={30}
-                      yMax={220}
+                      yMax={maxAerationChartY}
                       strokeColor="#22d3ee"
                       fillGradientId="grad_air_adjustments"
                       initialLine={{ value: 50, label: 'Partida 50 L/min' }}
-                      limitLine={{ value: 200, label: 'LIMITE MÁXIMO 200 L/min', color: '#f59e0b' }}
                       data={chronologicalAdjustments.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.aeration,
                         note: item.note,
                       }))}
@@ -2375,7 +2396,6 @@ export default function App() {
                       formatValue={(v) => formatPressure(v)}
                       data={chronologicalAdjustments.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.pressure,
                         note: item.note,
                       }))}
@@ -2393,7 +2413,6 @@ export default function App() {
                       formatValue={(v) => v.toFixed(1).replace('.', ',')}
                       data={chronologicalAdjustments.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.temp,
                         note: item.note,
                       }))}
@@ -2403,7 +2422,7 @@ export default function App() {
               </section>
             )}
 
-            {/* BLOCO B: GRÁFICOS A CADA 2 HORAS (0h ATÉ 24h) */}
+            {/* BLOCO B: GRÁFICOS A CADA 2 HORAS (0h ATÉ 60h) */}
             {(chartSourceFilter === 'ambos' || chartSourceFilter === '2h') && (
               <section className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden">
                 <div className="bg-[#131C2E] border-b border-slate-800 px-6 py-4 flex flex-wrap items-center justify-between gap-3">
@@ -2415,13 +2434,13 @@ export default function App() {
                       <h2 className="text-base font-bold text-white flex items-center gap-2">
                         <Clock className="w-4 h-4 text-emerald-400" />
                         <span>
-                          GRÁFICOS DO REPORTE A CADA 2 HORAS (0h ATÉ 24h · {recorded2hCount}{' '}
+                          GRÁFICOS DO REPORTE A CADA 2 HORAS (0h ATÉ 60h · {recorded2hCount}{' '}
                           horários registrados)
                         </span>
                       </h2>
                       <p className="text-xs text-slate-400">
                         Curva periódica de 2 em 2 horas da porcentagem de O₂ e de todos os demais
-                        parâmetros do cultivo
+                        parâmetros do cultivo (até 60h)
                       </p>
                     </div>
                   </div>
@@ -2429,7 +2448,7 @@ export default function App() {
 
                 <div className="p-6 space-y-5">
                   <TelemetryLineChart
-                    title="Porcentagem de O₂ Dissolvido a cada 2 Horas (0h – 24h)"
+                    title="Porcentagem de O₂ Dissolvido a cada 2 Horas (0h – 60h)"
                     subtitle="Acompanhamento periódico de O₂ (%) registrado nas janelas de 2 em 2 horas"
                     unit="%"
                     yMin={0}
@@ -2440,7 +2459,6 @@ export default function App() {
                     height={270}
                     data={recordedTwoHourSeries.map((item) => ({
                       label: item.label,
-                      sublabel: item.sublabel,
                       value: item.od,
                       note: item.note,
                     }))}
@@ -2459,7 +2477,6 @@ export default function App() {
                       limitLine={{ value: 230, label: 'LIMITE MÁXIMO 230 RPM', color: '#f59e0b' }}
                       data={recordedTwoHourSeries.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.rpm,
                         note: item.note,
                       }))}
@@ -2467,17 +2484,15 @@ export default function App() {
 
                     <TelemetryLineChart
                       title="2º Vazão de Ar a cada 2 Horas (L/min)"
-                      subtitle="Curva de Vazão de Ar ao longo das janelas de 2h (Partida: 50 L/min · Máx: 200 L/min)"
+                      subtitle="Curva de Vazão de Ar ao longo das janelas de 2h (Partida: 50 L/min · Liberado > 200 L/min)"
                       unit="L/min"
                       yMin={30}
-                      yMax={220}
+                      yMax={maxAerationChartY}
                       strokeColor="#06b6d4"
                       fillGradientId="grad_air_2h"
                       initialLine={{ value: 50, label: 'Partida 50 L/min' }}
-                      limitLine={{ value: 200, label: 'LIMITE MÁXIMO 200 L/min', color: '#f59e0b' }}
                       data={recordedTwoHourSeries.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.aeration,
                         note: item.note,
                       }))}
@@ -2500,7 +2515,6 @@ export default function App() {
                       formatValue={(v) => formatPressure(v)}
                       data={recordedTwoHourSeries.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.pressure,
                         note: item.note,
                       }))}
@@ -2518,7 +2532,6 @@ export default function App() {
                       formatValue={(v) => v.toFixed(1).replace('.', ',')}
                       data={recordedTwoHourSeries.map((item) => ({
                         label: item.label,
-                        sublabel: item.sublabel,
                         value: item.temp,
                         note: item.note,
                       }))}
@@ -2871,7 +2884,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* 2. Vazão de Ar */}
+                  {/* 2. Vazão de Ar (Liberada para passar de 200 L/min) */}
                   <div
                     className={`rounded-xl border p-4 flex flex-col justify-between space-y-3 ${
                       cascadeCalculation.deltaAeration > 0
@@ -2884,7 +2897,9 @@ export default function App() {
                         <Wind className="w-3.5 h-3.5 text-sky-400" />
                         2º Vazão de Ar
                       </span>
-                      <span className="text-[11px] font-mono text-slate-400">50 → 200 L/min</span>
+                      <span className="text-[11px] font-mono text-slate-400">
+                        Partida: 50 L/min (Livre &gt; 200)
+                      </span>
                     </div>
 
                     <div className="flex items-center gap-1.5">
@@ -2928,11 +2943,15 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() =>
-                          updateOdParam('currentAeration', PROCESS_LIMITS.MAX_AERATION, true)
+                          updateOdParam(
+                            'currentAeration',
+                            batch.odParams.currentAeration + 10,
+                            true
+                          )
                         }
-                        className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 font-mono text-xs font-semibold cursor-pointer"
+                        className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 font-mono text-xs font-semibold cursor-pointer"
                       >
-                        Máx
+                        +10
                       </button>
                     </div>
 
@@ -2964,8 +2983,6 @@ export default function App() {
                             Salvar
                           </button>
                         </>
-                      ) : batch.odParams.currentAeration >= PROCESS_LIMITS.MAX_AERATION ? (
-                        <span className="text-amber-300">Limite Máx (200 L/min)</span>
                       ) : (
                         <span className="text-emerald-400">
                           ✓ Manter ({batch.odParams.currentAeration} L/min)
@@ -3203,7 +3220,7 @@ export default function App() {
                           : 'bg-slate-900 text-slate-300 border border-slate-800'
                       }`}
                     >
-                      2º Subir Ar (50 → 200 L/min)
+                      2º Subir Ar (50 → &gt;200 L/min)
                     </span>
                     <ArrowRight className="w-3.5 h-3.5 text-slate-500" />
                     <span
@@ -3416,7 +3433,7 @@ export default function App() {
               </div>
             </section>
 
-            {/* SEÇÃO 3: REPORTE PERIÓDICO A CADA 2 HORAS (0h A 24h) */}
+            {/* SEÇÃO 3: REPORTE PERIÓDICO A CADA 2 HORAS (0h A 60h) */}
             <section
               id="registro-2h"
               className="bg-[#0F1624] border border-slate-800/90 rounded-xl overflow-hidden"
@@ -3428,10 +3445,10 @@ export default function App() {
                   </span>
                   <div>
                     <h2 className="text-base font-bold text-white">
-                      REPORTE DE PARÂMETROS A CADA 2 HORAS (0h ATÉ 24h)
+                      REPORTE DE PARÂMETROS A CADA 2 HORAS (0h ATÉ 60h)
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Acompanhamento periódico realizado pelos operadores ao longo do cultivo
+                      Acompanhamento periódico realizado pelos operadores ao longo do cultivo (até 60h)
                     </p>
                   </div>
                 </div>
@@ -3629,7 +3646,7 @@ export default function App() {
                                     </div>
                                     <div>
                                       <label className="block text-xs text-slate-400 mb-1">
-                                        Vazão Ar (50 → 200)
+                                        Vazão Ar (L/min · Livre &gt;200)
                                       </label>
                                       <input
                                         type="number"
